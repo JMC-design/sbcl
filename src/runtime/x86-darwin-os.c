@@ -85,17 +85,15 @@ int arch_os_thread_init(struct thread *thread) {
 #endif
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
     mach_lisp_thread_init(thread);
-#endif
-
-#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+#elif defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
     stack_t sigstack;
 
     /* Signal handlers are run on the control stack, so if it is exhausted
      * we had better use an alternate stack for whatever signal tells us
      * we've exhausted it */
-    sigstack.ss_sp=((void *) thread)+dynamic_values_bytes;
-    sigstack.ss_flags=0;
-    sigstack.ss_size = 32*SIGSTKSZ;
+    sigstack.ss_sp    = calc_altstack_base(thread);
+    sigstack.ss_flags = 0;
+    sigstack.ss_size  = calc_altstack_size(thread;
     sigaltstack(&sigstack,0);
 #endif
     return 1;                  /* success */
@@ -386,7 +384,7 @@ catch_exception_raise(mach_port_t exception_port,
 
     if (mach_port_get_context(mach_task_self(), exception_port, (mach_vm_address_t *)&th)
         != KERN_SUCCESS) {
-        lose("Can't find the thread for an exception %p", exception_port);
+        lose("Can't find the thread for an exception %u", exception_port);
     }
 
     /* Get state and info */
@@ -475,6 +473,15 @@ catch_exception_raise(mach_port_t exception_port,
         /* Trap call */
         handler = sigtrap_handler;
         break;
+    case EXC_BREAKPOINT:
+        if (single_stepping) {
+            signal = SIGTRAP;
+            /* Clear TF or the signal emulation wrapper won't proceed
+               with single stepping enabled. */
+            thread_state.EFLAGS &= ~0x100;
+            handler = sigtrap_handler;
+            break;
+        }
     default:
         ret = KERN_INVALID_RIGHT;
     }

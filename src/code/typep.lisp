@@ -14,7 +14,6 @@
 ;;; type TYPE. This behavior is needed e.g. to test for the validity
 ;;; of numeric subtype bounds read when cross-compiling.)
 (defun typep (object type &optional environment)
-  #!+sb-doc
   "Is OBJECT of type TYPE?"
   (declare (type lexenv-designator environment) (ignore environment))
   (declare (explicit-check))
@@ -54,7 +53,9 @@
                          (realpart object)
                          object)))
             (ecase (numeric-type-class type)
-              (integer (integerp num))
+              (integer (and (integerp num)
+                            (or (not (complexp object))
+                                (integerp (imagpart object)))))
               (rational (rationalp num))
               (float
                (ecase (numeric-type-format type)
@@ -189,7 +190,7 @@
          (satisfies
           (unless (proper-list-of-length-p hairy-spec 2)
             (error "invalid type specifier: ~S" hairy-spec))
-          (values (funcall (symbol-function (cadr hairy-spec)) object))))))
+          (and (funcall (symbol-function (cadr hairy-spec)) object) t)))))
     (alien-type-type
      (sb!alien-internals:alien-typep object (alien-type-type-alien-type type)))
     (fun-type
@@ -262,8 +263,8 @@
         (when (layout-invalid obj-layout)
           (setq obj-layout (update-object-layout-or-invalid object layout)))
         (%ensure-classoid-valid classoid layout "typep"))
-    (let ((obj-inherits (layout-inherits obj-layout)))
-      (or (eq obj-layout layout)
+    (or (eq obj-layout layout)
+        (let ((obj-inherits (layout-inherits obj-layout)))
           (dotimes (i (length obj-inherits) nil)
             (when (eq (svref obj-inherits i) layout)
               (return t)))))))

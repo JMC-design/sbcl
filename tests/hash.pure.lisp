@@ -45,11 +45,11 @@
   ;; but it's best to verify the assumption that each cons bumps the count
   ;; by 1, lest it be violated in a way that affects the quality of CTYPE
   ;; hashes.
-  (let ((win 0) (n-trials 10) (prev (sb-impl::address-based-counter-val)))
+  (let ((win 0) (n-trials 10) (prev (sb-int:address-based-counter-val)))
     (dotimes (i n-trials)
       (declare (notinline cons)) ; it's flushable, but don't flush it
       (cons 1 2)
-      (let ((ptr (sb-impl::address-based-counter-val)))
+      (let ((ptr (sb-int:address-based-counter-val)))
         (when (= ptr (1+ prev))
           (incf win))
         (setq prev ptr)))
@@ -115,3 +115,37 @@
             (maphash
              (constantly nil)
              (make-hash-table))))))
+
+(with-test (:name :equalp-hash-float-infinity)
+  (let ((table (make-hash-table :test 'equalp)))
+    (setf (gethash sb-ext:double-float-positive-infinity table) 1
+          (gethash sb-ext:double-float-negative-infinity table) -1)
+    (dolist (v (list sb-ext:single-float-positive-infinity
+                     sb-ext:double-float-positive-infinity
+                     (complex sb-ext:single-float-positive-infinity 0)
+                     (complex sb-ext:double-float-positive-infinity 0)))
+      (assert (eql (gethash v table) 1)))
+    (dolist (v (list sb-ext:single-float-negative-infinity
+                     sb-ext:double-float-negative-infinity
+                     (complex sb-ext:single-float-negative-infinity 0)
+                     (complex sb-ext:double-float-negative-infinity 0)))
+      (assert (eql (gethash v table) -1)))))
+
+(with-test (:name (:hash equalp pathname))
+  (let* ((map (make-hash-table :test 'equalp))
+         (key  #P"some/path/"))
+    (setf (gethash key map) "my-value")
+    (format (make-broadcast-stream) "Printing: ~A~%" key)
+    (assert (remhash key map))
+    (assert (= 0 (hash-table-count map)))))
+
+(with-test (:name :clrhash-clears-rehash-p)
+  (let ((tbl (make-hash-table)))
+    (dotimes (i 10)
+      (setf (gethash (cons 'foo (gensym)) tbl) 1))
+    (gc)
+    ;; The need-to-rehash bit is set
+    (assert (eql 1 (svref (sb-impl::hash-table-table tbl) 1)))
+    (clrhash tbl)
+    ;; The need-to-rehash bit is not set
+    (assert (eql 0 (svref (sb-impl::hash-table-table tbl) 1)))))

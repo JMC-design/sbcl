@@ -50,12 +50,12 @@
                                 compilation-speed)))
             (if (zerop safety)
                 (if (>= speed eff-space) :fast :small)
-                (if (>= speed eff-space) :fast-safe :safe)))))
+                (if (>= speed eff-space) :fast-safe :small-safe)))))
 
 ;;; Return true if LTN-POLICY is a safe policy.
 (defun ltn-policy-safe-p (ltn-policy)
   (ecase ltn-policy
-    ((:safe :fast-safe) t)
+    ((:safe :fast-safe :small-safe) t)
     ((:small :fast) nil)))
 
 ;;; For possibly-new blocks, make sure that there is an associated
@@ -82,6 +82,17 @@
             (new-popped lvar))
         (setf (ir2-block-popped old-ir2-block) (old-popped))
         (setf (ir2-block-popped new-ir2-block) (new-popped))))))
+
+(defun ir2-change-node-successor (node next-block)
+  (let* ((node-block (node-block node))
+         (old-next-block
+           (if (eq node (block-last node-block))
+               (first (block-succ node-block))
+               (let ((old-next-block (node-ends-block node)))
+                 (fixup-ir2-blocks-for-split-block node-block old-next-block)
+                 old-next-block))))
+    (unlink-blocks node-block old-next-block)
+    (link-blocks node-block next-block)))
 
 ;;; an annotated lvar's primitive-type
 #!-sb-fluid (declaim (inline lvar-ptype))
@@ -114,6 +125,7 @@
      ((lvar-delayed-leaf lvar)
       (setf (ir2-lvar-kind info) :delayed))
      (t (let ((tn (make-normal-tn (ir2-lvar-primitive-type info))))
+          (setf (tn-type tn) (lvar-type lvar))
           (setf (ir2-lvar-locs info) (list tn))
           (when (lvar-dynamic-extent lvar)
             (setf (ir2-lvar-stack-pointer info)
@@ -140,7 +152,8 @@
   (let* ((tn-ptype (primitive-type (lvar-type lvar)))
          (info (make-ir2-lvar tn-ptype)))
     (setf (lvar-info lvar) info)
-    (let ((name (lvar-fun-name lvar t)))
+    (let ((name (and (ref-p (lvar-uses lvar)) ;; lvar-fun-name sees through casts
+                     (lvar-fun-name lvar t))))
       (if (and delay name)
           (setf (ir2-lvar-kind info) :delayed)
           (setf (ir2-lvar-locs info)
@@ -158,16 +171,12 @@
   (declare (type basic-combination call))
   (let ((tails (and (node-tail-p call)
                     (lambda-tail-set (node-home-lambda call)))))
-    (when tails
-      (cond ((eq (return-info-kind (tail-set-info tails)) :unknown)
-             (node-ends-block call)
-             (let* ((block (node-block call))
-                    (new-block (first (block-succ block))))
-               (fixup-ir2-blocks-for-split-block block new-block)
-               (unlink-blocks block new-block)
-               (link-blocks block (component-tail (block-component block)))))
-            (t
-             (setf (node-tail-p call) nil)))))
+    (cond ((not tails))
+          ((eq (return-info-kind (tail-set-info tails)) :unknown)
+           (ir2-change-node-successor call
+                                      (component-tail (block-component (node-block call)))))
+          (t
+           (setf (node-tail-p call) nil))))
   (values))
 
 ;;; We set the kind to :FULL or :FUNNY, depending on whether there is
@@ -182,7 +191,6 @@
   (declare (type combination call))
   (let ((kind (basic-combination-kind call))
         (info (basic-combination-fun-info call)))
-    (annotate-fun-lvar (basic-combination-fun call))
 
     (dolist (arg (basic-combination-args call))
       (unless (lvar-info arg)
@@ -200,8 +208,9 @@
        (when (eq kind :error)
          (setf (basic-combination-kind call) :full))
        (setf (basic-combination-info call) :full)
+       (rewrite-full-call call)
        (flush-full-call-tail-transfer call))))
-
+  (annotate-fun-lvar (basic-combination-fun call))
   (values))
 
 ;;; Annotate an lvar for unknown multiple values:
@@ -213,13 +222,12 @@
 ;;; of LVAR's DEST, and called in the order that the lvarss are
 ;;; received. Otherwise the IR2-BLOCK-POPPED and
 ;;; IR2-COMPONENT-VALUES-FOO would get all messed up.
-(defun annotate-unknown-values-lvar (lvar)
+(defun annotate-unknown-values-lvar (lvar &optional unused-count)
   (declare (type lvar lvar))
-
   (aver (not (lvar-dynamic-extent lvar)))
   (let ((2lvar (make-ir2-lvar nil)))
     (setf (ir2-lvar-kind 2lvar) :unknown)
-    (setf (ir2-lvar-locs 2lvar) (make-unknown-values-locations))
+    (setf (ir2-lvar-locs 2lvar) (make-unknown-values-locations unused-count))
     (setf (lvar-info lvar) 2lvar))
 
   ;; The CAST chain with corresponding lvars constitute the same
@@ -239,10 +247,18 @@
 
 ;;; Annotate LVAR for a fixed, but arbitrary number of values, of the
 ;;; specified primitive TYPES.
-(defun annotate-fixed-values-lvar (lvar types)
+(defun annotate-fixed-values-lvar (lvar types &optional lvar-types)
   (declare (type lvar lvar) (list types))
   (let ((info (make-ir2-lvar nil)))
-    (setf (ir2-lvar-locs info) (mapcar #'make-normal-tn types))
+    (setf (ir2-lvar-locs info)
+          (loop for type in types
+                collect (if type
+                            (make-normal-tn type)
+                            (make-unused-tn))))
+    (when lvar-types
+      (loop for type in lvar-types
+            for tn in (ir2-lvar-locs info)
+            do (setf (tn-type tn) type)))
     (setf (lvar-info lvar) info)
     (when (lvar-dynamic-extent lvar)
       (aver (proper-list-of-length-p types 1))
@@ -277,7 +293,7 @@
   (let* ((lvar (return-result node))
          (fun (return-lambda node))
          (returns (tail-set-info (lambda-tail-set fun)))
-         (types (return-info-types returns)))
+         (types (return-info-primitive-types returns)))
     (if (eq (return-info-count returns) :unknown)
         (collect ((res *empty-type* values-type-union))
           (do-uses (use (return-result node))
@@ -294,8 +310,10 @@
               (if (eq kind :unknown)
                   (annotate-unknown-values-lvar lvar)
                   (annotate-fixed-values-lvar
-                   lvar (mapcar #'primitive-type types))))))
-        (annotate-fixed-values-lvar lvar types)))
+                   lvar (mapcar #'primitive-type types)
+                   types)))))
+        (annotate-fixed-values-lvar lvar types
+                                    (return-info-types returns))))
 
   (values))
 
@@ -312,7 +330,13 @@
         (annotate-fixed-values-lvar
          (first args)
          (mapcar (lambda (var)
-                   (primitive-type (basic-var-type var)))
+                   (cond
+                     ;; Needs support from the CALL VOPs, default-unknown-values specifically
+                     #!+(or x86-64 arm64)
+                     ((not (lambda-var-refs var))
+                      nil)
+                     (t
+                      (primitive-type (basic-var-type var)))))
                  (lambda-vars
                   (ref-leaf (lvar-use (basic-combination-fun call))))))
         (let ((types (mapcar (lambda (var)
@@ -326,7 +350,7 @@
                                         (lvar-derived-type arg)))
                    collect (if types
                                (pop types)
-                               *wild-type*)))))))
+                               *backend-t-primitive-type*)))))))
   (values))
 
 ;;; We force all the argument lvars to use the unknown values
@@ -355,7 +379,7 @@
            (setf (basic-combination-info call) :full)
            (annotate-fun-lvar (basic-combination-fun call) nil)
            (dolist (arg (reverse args))
-             (annotate-unknown-values-lvar arg))
+             (annotate-unknown-values-lvar arg t))
            (flush-full-call-tail-transfer call))))
 
   (values))
@@ -381,12 +405,7 @@
         (callee (combination-lambda call)))
     (aver (eq (lambda-tail-set caller)
               (lambda-tail-set (lambda-home callee))))
-    (node-ends-block call)
-    (let* ((block (node-block call))
-           (new-block (first (block-succ block))))
-      (fixup-ir2-blocks-for-split-block block new-block)
-      (unlink-blocks block new-block)
-      (link-blocks block (lambda-block callee))))
+    (ir2-change-node-successor call (lambda-block callee)))
   (values))
 
 ;;; Annotate the value lvar.
@@ -400,7 +419,7 @@
 ;;; conditional template, then don't annotate the lvar so that IR2
 ;;; conversion knows not to emit any code, otherwise annotate as an
 ;;; ordinary lvar. Since we only use a conditional template if the
-;;; call immediately precedes the IF node in the same block, we know
+;;; call immediately precedes the IF node, we know
 ;;; that any predicate will already be annotated.
 (defun ltn-analyze-if (node)
   (declare (type cif node))
@@ -474,24 +493,18 @@
                      (eq mem type))
              (return t))))
         (:constant
-         (cond (lvar
-                ;; Can't use constant-lvar-p, because it returns T for
-                ;; things for which the derived type is an EQL type,
-                ;; but there may be already a variable allocated for
-                ;; it, which can cause problems when there's a closure
-                ;; over it.
-                ;; See  :vop-on-eql-type test in compiler.pure for an example.
-                ;;
-                ;; And the value is already loaded into a register,
-                ;; which is usually cheaper/more compactly encoded
-                ;; than a constant.
-                (and (strictly-constant-lvar-p lvar)
-                     (funcall (second restr) (lvar-value lvar))))
-               (tn
-                (and (eq (tn-kind tn) :constant)
-                     (funcall (second restr) (tn-value tn))))
-               (t
-                (error "Neither LVAR nor TN supplied.")))))))
+         (flet ((type-p (value type)
+                  (if (typep type '(cons (eql satisfies)))
+                      (funcall (second type) value)
+                      (sb!xc:typep value type))))
+          (cond (lvar
+                 (and (constant-lvar-p lvar)
+                      (type-p (lvar-value lvar) (cdr restr))))
+                (tn
+                 (and (eq (tn-kind tn) :constant)
+                      (type-p (tn-value tn) (cdr restr))))
+                (t
+                 (error "Neither LVAR nor TN supplied."))))))))
 
 ;;; Check that the argument type restriction for TEMPLATE are
 ;;; satisfied in call. If an argument's TYPE-CHECK is :NO-CHECK and
@@ -655,13 +668,11 @@
                   (setq fallback template)))))))))
 
 (defvar *efficiency-note-limit* 2
-  #!+sb-doc
   "This is the maximum number of possible optimization alternatives will be
   mentioned in a particular efficiency note. NIL means no limit.")
 (declaim (type (or index null) *efficiency-note-limit*))
 
 (defvar *efficiency-note-cost-threshold* 5
-  #!+sb-doc
   "This is the minimum cost difference between the chosen implementation and
   the next alternative that justifies an efficiency note.")
 (declaim (type index *efficiency-note-cost-threshold*))
@@ -696,7 +707,7 @@
                               (ecase (car x)
                                 (:or `(:or .,(mapcar #'primitive-type-name
                                                      (cdr x))))
-                                (:constant `(:constant ,(third x))))))
+                                (:constant `(:constant . ,(cdr x))))))
                         (template-arg-types template))))
       (:conditional
        (funcall frob "conditional in a non-conditional context"))
@@ -744,10 +755,6 @@
           (when (and (or (not guard) (funcall guard))
                      (or (not safe-p)
                          (ltn-policy-safe-p (template-ltn-policy try)))
-                     ;; :SAFE is also considered to be :SMALL-SAFE,
-                     ;; while the template cost describes time cost;
-                     ;; so the fact that (< (t-cost try) (t-cost
-                     ;; template)) does not mean that TRY is better
                      (not (and (eq ltn-policy :safe)
                                (eq (template-ltn-policy try) :fast-safe)))
                      (or verbose-p
@@ -832,10 +839,12 @@
       ;; to implement an out-of-line version in terms of inline
       ;; transforms or VOPs or whatever.
       (unless template
-        (when (let ((funleaf (physenv-lambda (node-physenv call))))
+        (ltn-default-call call)
+        (when (let ((funleaf (physenv-lambda (node-physenv call)))
+                    (name (lvar-fun-name (combination-fun call))))
                 (and (leaf-has-source-name-p funleaf)
-                     (eq (lvar-fun-name (combination-fun call))
-                         (leaf-source-name funleaf))
+                     (eq name (leaf-source-name funleaf))
+                     (not (sb!vm::static-fdefn-offset name))
                      (let ((info (basic-combination-fun-info call)))
                        (not (or (fun-info-ir2-convert info)
                                 (ir1-attributep (fun-info-attributes info)
@@ -847,7 +856,7 @@
                            (mapcar (lambda (arg)
                                      (type-specifier (lvar-type arg)))
                                    args))))
-        (ltn-default-call call)
+
         (return-from ltn-analyze-known-call (values)))
       (setf (basic-combination-info call) template)
       (setf (node-tail-p call) nil)
@@ -865,15 +874,19 @@
 (defun ltn-analyze-cast (cast)
   (declare (type cast cast))
   (setf (node-tail-p cast) nil)
-  (when (and (cast-type-check cast)
-             (not (node-lvar cast)))
-    ;; FIXME
-    (bug "IR2 type checking of unused values is not implemented.")
-    )
+  (when (not (node-lvar cast))
+    (aver (not (cast-type-check cast)))
+    (labels ((unlink (lvar)
+               (do-uses (node lvar)
+                 (if (cast-p node)
+                     (unlink (cast-value node))
+                     (setf (node-lvar node) nil)))))
+      (unlink (cast-value cast))))
   (values))
 
 (defun ltn-annotate-casts (lvar)
   (declare (type lvar lvar))
+  (process-annotations lvar)
   (do-uses (node lvar)
     (when (cast-p node)
       (ltn-annotate-cast node))))
@@ -892,10 +905,11 @@
               (ctype (lvar-derived-type value)))
          (multiple-value-bind (types rest)
              (values-type-types ctype (specifier-type 'null))
-           (annotate-fixed-values-lvar
-            value
-            (mapcar #'primitive-type
-                    (adjust-list types count rest))))))))
+           (let ((types (adjust-list types count rest)))
+             (annotate-fixed-values-lvar
+              value
+              (mapcar #'primitive-type types)
+              types)))))))
   (values))
 
 
@@ -917,7 +931,7 @@
       (combination
        (ecase (basic-combination-kind node)
          (:local (ltn-analyze-local-call node))
-         ((:full :error) (ltn-default-call node))
+         ((:full :error :unknown-keys) (ltn-default-call node))
          (:known
           (ltn-analyze-known-call node))))
       (cif (ltn-analyze-if node))

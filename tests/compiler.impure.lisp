@@ -25,8 +25,6 @@
   (sb-ext:exit :code 104))
 
 (load "compiler-test-util.lisp")
-(use-package "TEST-UTIL")
-(use-package "ASSERTOID")
 
 ;;; Old CMU CL code assumed that the names of "keyword" arguments are
 ;;; necessarily self-evaluating symbols, but ANSI Common Lisp allows
@@ -47,16 +45,32 @@
 (defmacro ayup-duplicate-keys-are-ok-i-see-the-lite (&key k)
   k)
 (with-test (:name (:macro :lambda-list :duplicate &key :arguments))
-  (assert (equal (funcall (checked-compile
-                           '(lambda ()
-                              (ayup-duplicate-keys-are-ok-i-see-the-lite
-                               :k 112))))
-                 112))
-  (assert (equal (funcall (checked-compile
-                           '(lambda ()
-                             (ayup-duplicate-keys-are-ok-i-see-the-lite
-                              :k 'x :k 'y))))
-                 'x)))
+  (checked-compile-and-assert ()
+      '(lambda ()
+         (ayup-duplicate-keys-are-ok-i-see-the-lite :k 112))
+    (() 112))
+  (checked-compile-and-assert ()
+      '(lambda ()
+         (ayup-duplicate-keys-are-ok-i-see-the-lite :k 'x :k 'y))
+    (() 'x)))
+
+;;; Lexically binding a name that is 1) bound to a global symbol macro
+;;; 2) at home in a locked package
+
+(defpackage #:package-for-global-symbol-macro (:lock t))
+(cl:in-package #:package-for-global-symbol-macro)
+(cl:define-symbol-macro global-symbol-macro 1)
+(cl:in-package #:cl-user)
+
+(with-test (:name (let define-symbol-macro :locked package))
+  (multiple-value-bind (fun failure-p warnings)
+      (checked-compile
+       '(lambda () (let ((package-for-global-symbol-macro::global-symbol-macro 1))
+                     package-for-global-symbol-macro::global-symbol-macro))
+       :allow-failure t :allow-warnings t)
+    (declare (ignore fun))
+    (assert failure-p)
+    (assert warnings)))
 
 ;;; As reported by Alexey Dejneka (sbcl-devel 2002-01-30), in
 ;;; sbcl-0.7.1 plus his patch (i.e. essentially sbcl-0.7.1.2), the
@@ -76,8 +90,13 @@
 ;;; catch tags are still a bad idea because EQ is used to compare
 ;;; tags, and EQ comparison on INTEGERs is unportable; but now it's a
 ;;; compiler warning instead of a failure to compile.)
-(defun foo ()
-  (catch 0 (print 1331)))
+(with-test (:name (compile catch :integer-valued-tag :bug-132))
+  (multiple-value-bind (fun failure-p warnings style-warnings)
+      (checked-compile '(lambda () (catch 0 (print 1331 (make-broadcast-stream))))
+                       :allow-style-warnings t)
+    (declare (ignore failure-p warnings))
+    (funcall fun)
+    (assert style-warnings)))
 
 ;;; Bug 150: In sbcl-0.7.1.15, compiling this code caused a failure in
 ;;; SB-C::ADD-TEST-CONSTRAINTS:
@@ -497,7 +516,7 @@
     (unwind-protect
          (progn
            (setq *bug204-test-status* nil)
-           (compile-file src)
+           (compile-file src :verbose nil :print nil)
            (assert (equal *bug204-test-status* '((:expanded :load-toplevel)
                                                  (:called :compile-toplevel)
                                                  (:expanded :compile-toplevel))))
@@ -516,7 +535,7 @@
     (unwind-protect
          (progn
            (setq *symbol-macrolet-test-status* nil)
-           (compile-file src)
+           (compile-file src :verbose nil :print nil)
            (assert (equal *symbol-macrolet-test-status*
                           '(2 1)))
            (setq *symbol-macrolet-test-status* nil)
@@ -554,15 +573,16 @@
   (bug211b))
 
 (with-test (:name (compile :lambda-list :bug-211c))
-  (let ((fun (checked-compile
-              '(lambda ()
-                (flet ((test (&key (x :x x-p))
-                         (list x x-p)))
-                  (assert (equal (test) '(:x nil)))
-                  (assert (equal (test :x 1) '(1 t)))
-                  (assert (equal (test :y 2 :allow-other-keys 11 :allow-other-keys nil)
-                                 '(:x nil))))))))
-    (funcall fun)))
+  (checked-compile-and-assert ()
+      '(lambda ()
+         (flet ((test (&key (x :x x-p))
+                  (list x x-p)))
+           (assert (equal (test) '(:x nil)))
+           (assert (equal (test :x 1) '(1 t)))
+           (assert (equal (test :y 2 :allow-other-keys 11 :allow-other-keys nil)
+                          '(:x nil)))
+           nil))
+      (() nil)))
 
 (with-test (:name (compile :lambda-list :allow-other-keys
                            :bug-211 :do-not-allow))
@@ -695,42 +715,43 @@
 (assert (= (bug219-b-aux2 1)
            (if *bug219-b-expanded-p* 3 1)))
 
-;;; bug 224: failure in unreachable code deletion
-(defmacro do-optimizations (&body body)
-  `(dotimes (.speed. 4)
-     (dotimes (.space. 4)
-       (dotimes (.debug. 4)
-         (dotimes (.compilation-speed. 4)
-           (proclaim `(optimize (speed , .speed.) (space , .space.)
-                                (debug , .debug.)
-                                (compilation-speed , .compilation-speed.)))
-           ,@body)))))
-
 (with-test (:name (:unreachable-code locally declare :bug-224))
-  (do-optimizations
-    (checked-compile
-     (read-from-string
-      "(lambda ()
-         (#:localy (declare (optimize (safety 3)))
-           (ignore-errors (progn (values-list (car (list '(1 . 2)))) t))))")
-     :allow-failure t :allow-style-warnings t)))
+  (map-optimize-declarations
+   (lambda (declaration)
+     (multiple-value-bind (fun failure-p warnings style-warnings)
+         (checked-compile
+          `(lambda ()
+             (declare (optimize ,@declaration))
+             (,(gensym "LOCALY") (declare (optimize (safety 3)))
+              (ignore-errors (progn (values-list (car (list '(1 . 2)))) t))))
+          :allow-failure t :allow-style-warnings t)
+       (declare (ignore fun warnings))
+       (assert failure-p)
+       (assert (= (length style-warnings) 1))))
+   :safety nil))
 
 (with-test (:name (:unreachable-code error labels :bug-224))
-  (do-optimizations
-    (checked-compile
-     '(lambda ()
-       (labels ((ext ()
-                  (tagbody
-                     (labels ((i1 () (list (i2) (i2)))
-                              (i2 () (list (int) (i1)))
-                              (int () (go :exit)))
-                       (list (i1) (i1) (i1)))
-                   :exit (return-from ext))))
-         (list (error "nih") (ext) (ext)))))))
+  (map-optimize-declarations
+   (lambda (declaration)
+     (checked-compile `(lambda ()
+                         (declare (optimize ,@declaration))
+                         (labels ((ext ()
+                                    (tagbody
+                                       (labels ((i1 () (list (i2) (i2)))
+                                                (i2 () (list (int) (i1)))
+                                                (int () (go :exit)))
+                                         (list (i1) (i1) (i1)))
+                                     :exit (return-from ext))))
+                           (list (error "nih") (ext) (ext))))))
+   :safety nil))
 
 (with-test (:name (:unreachable-code error let :bug-224))
-  (do-optimizations
-    (checked-compile '(lambda (x) (let ((y (error ""))) (list x y))))))
+  (map-optimize-declarations
+    (lambda (declaration)
+      (checked-compile `(lambda (x)
+                          (declare (optimize ,@declaration))
+                          (let ((y (error ""))) (list x y)))))
+    :safety nil))
 
 ;;; bug 223: invalid moving of global function name referencing
 (defun bug223-int (n)
@@ -797,7 +818,8 @@
 (with-test (:name (function-lambda-expression compile :bug-228))
   (let ((x (function-lambda-expression #'bug228)))
     (when x
-      (assert (= (funcall (checked-compile x) 1) 2)))))
+      (checked-compile-and-assert (:optimize nil) x
+        ((1) 2)))))
 
 ;;;
 (defun bug192b (i)
@@ -929,12 +951,13 @@
                                 1 (make-instance 'broken-input-stream))
                        :test-broken)
                    (type-error (c)
+                     c
                      (return-from return :good))))
                :good)))
 
 ;;;; MUFFLE-CONDITIONS test (corresponds to the test in the manual)
 ; FIXME: make a better test!
-(with-test (:name muffle-conditions :skipped-on '(or :alpha :x86-64))
+(with-test (:name muffle-conditions :skipped-on (or :alpha :x86-64))
   (multiple-value-bind (fun failure-p warnings style-warnings notes)
       (checked-compile
        '(lambda (x)
@@ -962,6 +985,7 @@
 
 ;;; No bogus warnings for calls to functions with complex lambda-lists.
 (defun complex-function-signature (&optional x &rest y &key z1 z2)
+  (declare (ignore z1 z2))
   (cons x y))
 (with-test (:name :complex-call-doesnt-warn)
   (checked-compile '(lambda (x) (complex-function-signature x :z1 1 :z2 2))))
@@ -1091,10 +1115,10 @@
                                 :initial-element #c(-1.0 -2.0)))))))
 
 (with-test (:name :make-array-symbol-as-initial-element)
-  (assert (every (lambda (x) (eq x 'a))
-                 (funcall (checked-compile
-                           `(lambda ()
-                              (make-array 12 :initial-element 'a)))))))
+  (checked-compile-and-assert ()
+      `(lambda ()
+         (make-array 12 :initial-element 'a))
+    (() #(a a a a a a a a a a a a) :test 'equalp)))
 
 ;;; This non-minimal test-case catches a nasty error when loading
 ;;; inline constants.
@@ -1257,20 +1281,21 @@
                   (sb-kernel:specifier-type
                    (sb-kernel:%simple-fun-type fun))))))
              (test (type1 type2 form value-cell-p)
-             (let* ((lambda-form `(lambda ()
-                                    (load-time-value ,form)))
-                    (core-fun (checked-compile lambda-form))
-                    (core-type (funtype core-fun))
-                    (defun-form `(defun ,name ()
-                                   (load-time-value ,form)))
-                    (file-fun (progn
-                                (ctu:file-compile (list defun-form) :load t)
-                                (symbol-function name)))
-                    (file-type (funtype file-fun)))
-               (unless (subtypep core-type type1)
-                 (error "core: wanted ~S, got ~S" type1 core-type))
-               (unless (subtypep file-type type2)
-                 (error "file: wanted ~S, got ~S" type2 file-type)))))
+               (declare (ignore value-cell-p))
+               (let* ((lambda-form `(lambda ()
+                                      (load-time-value ,form)))
+                      (core-fun (checked-compile lambda-form))
+                      (core-type (funtype core-fun))
+                      (defun-form `(defun ,name ()
+                                     (load-time-value ,form)))
+                      (file-fun (let ((*error-output* (make-broadcast-stream)))
+                                  (ctu:file-compile (list defun-form) :load t)
+                                  (symbol-function name)))
+                      (file-type (funtype file-fun)))
+                 (unless (subtypep core-type type1)
+                   (error "core: wanted ~S, got ~S" type1 core-type))
+                 (unless (subtypep file-type type2)
+                   (error "file: wanted ~S, got ~S" type2 file-type)))))
       (let ((* 10))
         (test '(integer 11 11) 'number
               '(+ * 1) nil))
@@ -1319,6 +1344,7 @@
   (flet ((test (forms)
            (catch 'debug
              (let ((*debugger-hook* (lambda (condition if)
+                                      (declare (ignore if))
                                       (throw 'debug
                                         (if (typep condition 'serious-condition)
                                             :debug
@@ -1349,16 +1375,19 @@
       form))
 
 (with-test (:name (:cmacro-with-simple-key :no-key))
-  (let ((fun (checked-compile `(lambda () (cmacro-with-simple-key)))))
-    (assert (string= "cmacro=NIL" (funcall fun)))))
+  (checked-compile-and-assert ()
+      `(lambda () (cmacro-with-simple-key))
+    (() "cmacro=NIL")))
 
 (with-test (:name (:cmacro-with-simple-key :constant-key))
-  (let ((fun (checked-compile `(lambda () (cmacro-with-simple-key :a 42)))))
-    (assert (string= "cmacro=42" (funcall fun)))))
+  (checked-compile-and-assert ()
+      `(lambda () (cmacro-with-simple-key :a 42))
+    (() "cmacro=42")))
 
 (with-test (:name (:cmacro-with-simple-key :variable-key))
-  (let ((fun (checked-compile `(lambda (x) (cmacro-with-simple-key x 42)))))
-    (assert (string= "fun=42" (funcall fun :a)))))
+  (checked-compile-and-assert ()
+      `(lambda (x) (cmacro-with-simple-key x 42))
+    ((:a) "fun=42")))
 
 (defun cmacro-with-nasty-key (&key ((nasty-key var)))
   (format nil "fun=~A" var))
@@ -1368,20 +1397,21 @@
       form))
 
 (with-test (:name (:cmacro-with-nasty-key :no-key))
-  (let ((fun (checked-compile `(lambda () (cmacro-with-nasty-key)))))
-    (assert (string= "cmacro=NIL" (funcall fun)))))
+  (checked-compile-and-assert ()
+      `(lambda () (cmacro-with-nasty-key))
+    (() "cmacro=NIL")))
 
 (with-test (:name (:cmacro-with-nasty-key :constant-key))
   ;; This bogosity is thanks to cmacro lambda lists being /macro/ lambda
   ;; lists.
-  (let ((fun (checked-compile
-              `(lambda () (cmacro-with-nasty-key 'nasty-key 42)))))
-    (assert (string= "fun=42" (funcall fun)))))
+  (checked-compile-and-assert ()
+      `(lambda () (cmacro-with-nasty-key 'nasty-key 42))
+    (() "fun=42")))
 
 (with-test (:name (:cmacro-with-nasty-key :variable-key))
-  (let ((fun (checked-compile
-              `(lambda (nasty-key) (cmacro-with-nasty-key nasty-key 42)))))
-    (assert (string= "fun=42" (funcall fun 'nasty-key)))))
+  (checked-compile-and-assert ()
+      `(lambda (nasty-key) (cmacro-with-nasty-key nasty-key 42))
+    (('nasty-key) "fun=42")))
 
 (defconstant tricky-key 'tricky-key)
 (defun cmacro-with-tricky-key (&key ((tricky-key var)))
@@ -1469,10 +1499,12 @@
     (sb-ext:restrict-compiler-policy 'debug 0)))
 
 (with-test (:name :restrict-compiler-policy-result)
-  (let ((sb-c::*policy-restrictions* sb-c::*policy-restrictions*))
+  (let ((sb-c::*policy-min* sb-c::*policy-min*)
+        (sb-c::*policy-max* sb-c::*policy-max*))
     (sb-ext:restrict-compiler-policy 'safety 2)
     (checked-compile '(lambda () (declare (optimize (safety 0))))))
-  (let ((sb-c::*policy-restrictions* sb-c::*policy-restrictions*))
+  (let ((sb-c::*policy-min* sb-c::*policy-min*)
+        (sb-c::*policy-max* sb-c::*policy-max*))
     ;; Passing no arguments returns the current quality/value pairs.
     (assert (null (sb-ext:restrict-compiler-policy)))
     (let ((res (sb-ext:restrict-compiler-policy 'safety 2)))
@@ -1521,12 +1553,14 @@
               (types types (rest types)))
              ((null ltypes)
               (unless (null types)
+                #+nil
                 (format t "~&More types than ltypes in ~A, translating ~A.~%"
                         (template-name template)
                         function)
                 (return nil)))
            (when (null types)
              (unless (null ltypes)
+               #+nil
                (format t "~&More ltypes than types in ~A, translating ~A.~%"
                        (template-name template)
                        function)
@@ -1544,7 +1578,7 @@
          (return nil))
         (t t)))))
 (test-util:with-test (:name :identify-suspect-vops)
-  (sb-c::call-with-each-globaldb-name
+  (sb-int:call-with-each-globaldb-name
    (lambda (name)
      ;; LEGAL-FUN-NAME-P test is necessary, since (INFO :FUNCTION :TYPE)
      ;; has a defaulting expression that involves calling FDEFINITION.
@@ -1617,6 +1651,7 @@
       (assert (= e-count 4)))))
 
 ;;; bug #389 (Rick Taube sbcl-devel)
+(declaim (ftype function bes-j0 bes-j1))
 (defun bes-jn (unn ux)
    (let ((nn unn) (x ux))
      (let* ((n (floor (abs nn)))
@@ -2078,7 +2113,8 @@
 
 ;;; bug 417: toplevel NIL confusing source path logic
 (handler-case
-    (delete-file (compile-file "bug-417.lisp"))
+    (delete-file (let ((*error-output* (make-broadcast-stream)))
+                   (compile-file "bug-417.lisp" :verbose nil :print nil)))
   (sb-ext:code-deletion-note (e)
     (error e)))
 
@@ -2135,7 +2171,8 @@
          (progn
            (with-open-file (f lisp :direction :output)
              (prin1 `(setf *lambda* ,lambda) f))
-           (multiple-value-bind (fasl warn fail) (compile-file lisp)
+           (multiple-value-bind (fasl warn fail)
+               (compile-file lisp :verbose nil :print nil)
              (declare (ignore warn))
              (when fail
                (error "File-compiling ~S failed." lambda))
@@ -2265,12 +2302,10 @@
   42)
 (declaim (notinline bug-655581))
 (test-util:with-test (:name :bug-655581)
-  (multiple-value-bind (type derived)
-      (funcall (test-util:checked-compile
-                `(lambda ()
-                   (ctu:compiler-derived-type (bug-655581)))))
-    (assert derived)
-    (assert (equal '(integer 42 42) type))))
+  (test-util:checked-compile-and-assert ()
+      `(lambda ()
+         (ctu:compiler-derived-type (bug-655581)))
+    (() (values '(integer 42 42) t))))
 
 (test-util:with-test (:name :clear-derived-types-on-set-fdefn)
   (let ((*evaluator-mode* :compile)
@@ -2364,26 +2399,25 @@
 (defglobal **global-symbol-value-test-var** 0)
 
 (test-util:with-test (:name :symbol-value-type-derivation)
-  (let ((fun (compile
-              nil
-              `(lambda ()
-                 *symbol-value-test-var*))))
+  (let ((fun (compile nil `(lambda () *symbol-value-test-var*))))
     (assert (equal '(function () (values unsigned-byte &optional))
                    (%simple-fun-type fun))))
-  (let ((fun (compile
-              nil
-              `(lambda ()
-                 **global-symbol-value-test-var**))))
+  (let ((fun (compile nil `(lambda () **global-symbol-value-test-var**))))
     (assert (equal '(function () (values unsigned-byte &optional))
                    (%simple-fun-type fun))))
-  (let ((fun (compile
-              nil
-              `(lambda (*symbol-value-test-var*)
-                 (declare (fixnum *symbol-value-test-var*))
-                 (symbol-value '*symbol-value-test-var*))))
-        (ufix (type-specifier (specifier-type `(and unsigned-byte fixnum)))))
-    (assert (equal `(function (,ufix) (values ,ufix &optional))
-                   (%simple-fun-type fun))))
+  (let ((ufix (type-specifier (specifier-type `(and unsigned-byte fixnum)))))
+    ;; Test a free type decl
+    (let ((fun (compile nil `(lambda ()
+                               (declare (fixnum *symbol-value-test-var*))
+                               (symbol-value '*symbol-value-test-var*)))))
+      (assert (equal `(function () (values ,ufix &optional))
+                     (%simple-fun-type fun))))
+    ;; Test a bound type decl
+    (let ((fun (compile nil `(lambda (*symbol-value-test-var*)
+                               (declare (fixnum *symbol-value-test-var*))
+                               (symbol-value '*symbol-value-test-var*)))))
+      (assert (equal `(function (,ufix) (values ,ufix &optional))
+                     (%simple-fun-type fun)))))
   (let ((fun (compile
               nil
               `(lambda ()
@@ -2484,7 +2518,8 @@
   ;; as source forms.
   (let* ((src "bug-943953.lisp")
          (obj (compile-file-pathname src)))
-    (unwind-protect (compile-file src)
+    (unwind-protect (let ((*error-output* (make-broadcast-stream)))
+                      (compile-file src :verbose nil :print nil))
       (ignore-errors (delete-file obj)))))
 
 (declaim (inline vec-1177703))
@@ -2612,8 +2647,9 @@
 (in-package :cl-user)
 
 (with-test (:name :merge-lambdas-dead-return)
-  (let ((fasl (compile-file "merge-lambdas.lisp"
-                            :print nil :verbose nil)))
+  (let ((fasl (let ((*error-output* (make-broadcast-stream)))
+                (compile-file "merge-lambdas.lisp"
+                              :print nil :verbose nil))))
     (ignore-errors (delete-file fasl))))
 
 (declaim (inline ensure-a-fun))
@@ -2660,8 +2696,10 @@
   (catch-compiled-program-error
    '(lambda (x) (typep x '(values 10)))
    1)
-  (catch-compiled-program-error
-   '(lambda () (declare (sb-ext:muffle-conditions 10)))))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda () (declare (sb-ext:muffle-conditions 10)))
+                      :allow-warnings t))))
 
 (with-test (:name :coverage-and-errors)
   (ctu:file-compile
@@ -2684,7 +2722,7 @@
     (assert (equal (eval `(defun ,name ()))
                    name))))
 
-(with-test (:name :make-sequence-unknown)
+(with-test (:name (make-sequence :unknown type))
   (let ((fun (checked-compile
               `(lambda (x)
                  (let ((vector (make-sequence '(simple-array make-sequence-unknown (*)) 10)))
@@ -2720,27 +2758,31 @@
        ((function (function *))       "(FUNCTION (FUNCTION *))")
        ((function (function (eql 1))) "(FUNCTION (FUNCTION (EQL 1))")))))
 
-(with-test (:name :boxed-ref-setf-special)
+(with-test (:name :boxed-ref-setf-special
+            :skipped-on :interpreter)
   (let* ((var (gensym))
          (fun (checked-compile `(lambda ()
                                   (declare (special ,var))
                                   (setf ,var 10d0)))))
     (ctu:assert-no-consing (funcall fun))))
 
-(with-test (:name :boxed-ref-bind-special)
+(with-test (:name :boxed-ref-bind-special
+            :skipped-on :interpreter)
   (let* ((var (gensym))
          (fun (checked-compile `(lambda ()
                                   (let ((,var 10d0))
                                     (declare (special ,var)))))))
     (ctu:assert-no-consing (funcall fun))))
 
-(with-test (:name :boxed-ref-svref)
+(with-test (:name :boxed-ref-svref
+            :skipped-on :interpreter)
   (let ((fun (checked-compile `(lambda (x)
                                  (setf (svref x 0) 10d0))))
         (vector (vector nil)))
     (ctu:assert-no-consing (funcall fun vector))))
 
-(with-test (:name :boxed-ref-instance-set)
+(with-test (:name :boxed-ref-instance-set
+            :skipped-on :interpreter)
   (let* ((name (gensym "STRUCT"))
          (fun (progn
                 (eval `(defstruct ,name x))
@@ -2750,9 +2792,116 @@
          (instance (funcall (sb-int:symbolicate 'make- name))))
     (ctu:assert-no-consing (funcall fun instance))))
 
-(with-test (:name :boxed-ref-car)
+(with-test (:name :boxed-ref-car
+            :skipped-on :interpreter)
   (let ((fun (checked-compile `(lambda (x)
                                  (setf (car x) 10d0)
                                  (setf (cdr x) 10d0))))
         (list (list nil)))
     (ctu:assert-no-consing (funcall fun list))))
+
+
+(with-test (:name :ftype-return-type-conflict
+            ;; Not having UNWIND-TO-FRAME-AND-CALL-VOP changes
+            ;; the condition type here?
+            :fails-on (not :unwind-to-frame-and-call-vop))
+  (proclaim '(ftype (function () fixnum) ftype-return-type-conflict))
+  (checked-compile-and-assert (:optimize :safe :allow-warnings t)
+      `(sb-int:named-lambda ftype-return-type-conflict () nil)
+    (() (condition 'type-error))))
+
+
+(declaim (inline bug-1728074-to-boolean bug-1728074-foo))
+(defun bug-1728074-to-boolean (x) (/= x 0))
+(defun bug-1728074-foo (storage key converter)
+  (labels ((value (entry)
+             (funcall converter (ash entry -17)))
+           (insert (start key new)
+             (when *
+               (return-from insert (value (aref storage start))))
+             (let ((entry (aref storage start)))
+               (let* ((okey (logand entry #xf00))
+                      (ostart (logand okey #xf)))
+                 (unless (= ostart start)
+                   (insert ostart okey entry)))))
+           (probe (index)
+             (let ((entry (aref storage index)))
+               (when (= key (logand #xf00 entry))
+                 (value entry)))))
+    (declare (inline value))
+    (probe (logand key #xf))))
+
+(with-test (:name :defined-fun-in-a-deleted-home-lambda)
+  (checked-compile `(lambda (cache key) (bug-1728074-foo cache key #'bug-1728074-to-boolean))))
+
+(defstruct (lambda-var-ref-lvar-null (:type list))
+  (x nil)
+  (y 0))
+
+(with-test (:name :lambda-var-ref-lvar-null)
+  (assert (nth-value 1
+                     (checked-compile
+                      `(lambda (a)
+                         (setf (lambda-var-ref-lvar-null-x :b) nil
+                               (lambda-var-ref-lvar-null-y a) 0))
+                      :allow-warnings t))))
+
+(sb-c:defknown blah * * (sb-c:foldable))
+(defun blah (x) (- x))
+(with-test (:name :foldable-wild-args-fun)
+  (assert (eql (funcall (checked-compile '(lambda () (blah (+ 1 2))))) -3)))
+
+
+(declaim (ftype (function * (values cons &optional)) safety-zero-return-checking)
+         (inline safety-zero-return-checking))
+(defun safety-zero-return-checking (x)
+  x)
+
+(with-test (:name :safety-zero-return-checking)
+  (assert (nth-value 1 (checked-compile `(lambda ()
+                                           (declare (optimize (safety 0)))
+                                           (safety-zero-return-checking 1))
+                                        :allow-warnings t))))
+
+(with-test (:name :inline-macrolet-debug-0)
+  (let* ((fun (gensym "FUN"))
+         (fun (eval
+               `(locally (declare (optimize (debug 0)))
+                  (macrolet ((macro () 10))
+                    (proclaim '(inline ,fun))
+                    (defun ,fun () (macro)))
+                  (lambda () (,fun))))))
+    (assert (= (funcall fun) 10))))
+
+(with-test (:name :substitute-lvar-updating-lvar-dependenceis)
+  (let ((name (gensym)))
+    (proclaim `(ftype (function * (values number &optional))
+                      ,name))
+    (checked-compile-and-assert
+     ()
+     `(sb-int:named-lambda ,name (x fun)
+        (block nil
+          (labels
+              ((snoop ()
+                 (return
+                   (funcall fun))))
+            (declare (inline snoop))
+            (when (plusp x)
+              (snoop))
+            (when (plusp x)
+              (snoop))
+            33)))
+     ((10 (constantly 131)) 131))))
+
+(defvar *symbol-value-bound-here-escaping* 10)
+
+(with-test (:name :symbol-value-bound-here-escaping)
+  (assert (eql (funcall
+                (funcall
+                 (checked-compile
+                  `(lambda ()
+                     (let (*symbol-value-bound-here-escaping*)
+                       (lambda ()
+                         (let (*symbol-value-bound-here-escaping*))
+                         *symbol-value-bound-here-escaping*))))))
+               10)))

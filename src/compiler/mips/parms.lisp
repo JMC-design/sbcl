@@ -8,6 +8,15 @@
 ;;;; files for more information.
 
 (in-package "SB!VM")
+
+(defconstant sb!assem:assem-scheduler-p t)
+(defconstant sb!assem:+inst-alignment-bytes+ 4)
+
+(defconstant +backend-fasl-file-implementation+ :mips)
+
+  ;; The o32 ABI specifies 4k-64k as page size. We have to pick the
+  ;; maximum since mprotect() works only with page granularity.
+(defconstant +backend-page-bytes+ 65536)
 
 ;;;; Machine Architecture parameters:
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -18,10 +27,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 32)
-
-;;; number of bits per byte where a byte is the smallest addressable
-;;; object
-(defconstant n-byte-bits 8)
 
 (defconstant float-sign-shift 31)
 
@@ -79,10 +84,8 @@
   (defconstant static-space-start    #x06000000)
   (defconstant static-space-end      #x08000000)
 
-  (defconstant dynamic-0-space-start #x08000000)
-  (defconstant dynamic-0-space-end   #x0c000000)
-  (defconstant dynamic-1-space-start #x0c000000)
-  (defconstant dynamic-1-space-end   #x10000000))
+  (defparameter dynamic-0-space-start #x08000000)
+  (defparameter dynamic-0-space-end   #x0c000000))
 
 #!+linux
 (progn
@@ -96,10 +99,8 @@
   (defconstant static-space-end      #x0fff0000)
   ;; C runtime read/write segment starts at 0x10000000, heap and DSOs
   ;; start at 0x2a000000
-  (defconstant dynamic-0-space-start #x30000000)
-  (defconstant dynamic-0-space-end   #x4fff0000)
-  (defconstant dynamic-1-space-start #x50000000)
-  (defconstant dynamic-1-space-end   #x6fff0000)
+  (defparameter dynamic-0-space-start #x30000000)
+  (defparameter dynamic-0-space-end   #x4fff0000)
 
   (defconstant linkage-table-space-start #x70000000)
   (defconstant linkage-table-space-end   #x71000000)
@@ -120,13 +121,13 @@
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   after-breakpoint-trap
   single-step-around-trap
-  single-step-before-trap)
+  single-step-before-trap
+  error-trap)
 
 ;;;; Static symbols.
 
@@ -137,14 +138,12 @@
 ;;; The fdefn objects for the static functions are loaded into static
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '()))
+(defconstant-eqx +static-symbols+
+  `#(,@+common-static-symbols+)
+  #'equalp)
 
-(defparameter *static-funs*
-  '(two-arg-+
+(defconstant-eqx +static-fdefns+
+  #(two-arg-+
     two-arg--
     two-arg-*
     two-arg-/
@@ -161,4 +160,5 @@
     two-arg-xor
     length
     two-arg-gcd
-    two-arg-lcm))
+    two-arg-lcm)
+  #'equalp)

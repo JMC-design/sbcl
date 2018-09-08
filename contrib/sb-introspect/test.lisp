@@ -66,7 +66,7 @@
 
 (define-modify-macro q (x) logand)
 
-(define-method-combination r nil)
+(define-method-combination r)
 
 (define-setf-expander s (a b)
   (format t "~a ~a~%" a b))
@@ -88,3 +88,8 @@
 (define-condition test-condition (error)
   ((a :reader condition-slot-reader
       :writer condition-slot-writer)))
+
+(defun with-a-local-function ()
+  (flet ((x ()))
+    (declare (notinline x))
+    (x)))

@@ -36,15 +36,15 @@
 
 (defgeneric eql-specializer-object (eql-specializer))
 
-(defgeneric generic-function-declarations (standard-generic-function))
+(defgeneric generic-function-declarations (generic-function))
 
-(defgeneric generic-function-method-class (standard-generic-function))
+(defgeneric generic-function-method-class (generic-function))
 
-(defgeneric generic-function-method-combination (standard-generic-function))
+(defgeneric generic-function-method-combination (generic-function))
 
-(defgeneric generic-function-methods (standard-generic-function))
+(defgeneric generic-function-methods (generic-function))
 
-(defgeneric generic-function-name (standard-generic-function))
+(defgeneric generic-function-name (generic-function))
 
 (defgeneric gf-arg-info (standard-generic-function))
 
@@ -207,9 +207,9 @@
 
 (defgeneric function-keywords (method))
 
-(defgeneric generic-function-argument-precedence-order (gf))
+(defgeneric generic-function-argument-precedence-order (generic-function))
 
-(defgeneric generic-function-lambda-list (gf))
+(defgeneric generic-function-lambda-list (generic-function))
 
 (defgeneric generic-function-pretty-arglist (generic-function))
 
@@ -315,11 +315,6 @@
 
 (defgeneric invalid-superclass (class superclass))
 
-(defgeneric (setf documentation) (new-value slotd doc-type)
-  (:argument-precedence-order doc-type slotd new-value))
-
-(defgeneric documentation (slotd doc-type)
-  (:argument-precedence-order doc-type slotd))
 
 ;;;; 3 arguments
 
@@ -356,6 +351,31 @@
 (defgeneric slot-unbound (class instance slot-name))
 
 (defgeneric slot-value-using-class (class object slotd))
+
+(defgeneric specializer-type-specifier
+    (proto-generic-function proto-method specializer)
+  #+sb-doc
+  (:documentation
+   "Return a type specifier for SPECIALIZER, a non-parsed specializer
+form or a SPECIALIZER instance.
+
+More specifically, SPECIALIZER can be
+* a non-parsed specializer form such as
+  * a symbol naming a class
+  * a list of the form (eql OBJECT)
+  * a list of the form (SPECIALIZER-KIND &rest SPECIFIC-SYNTAX)
+* an instance of a subclass of SPECIALIZER
+
+When SPECIALIZER cannot be parsed/used as a specializer for
+PROTO-GENERIC-FUNCTION and PROTO-METHOD, a STYLE-WARNING is signaled
+and NIL is returned. No type declaration will be generated in this
+case.
+
+NIL can also be returned if SPECIALIZER is valid but its type should
+not be declared, for example for efficiency reasons.
+
+NOTE: This generic function is part of an SBCL-specific experimental
+protocol. Interface subject to change."))
 
 ;;;; 4 arguments
 
@@ -397,7 +417,6 @@
 (defgeneric make-specializer-form-using-class
     (proto-generic-function proto-method specializer-name environment)
   (:method-combination or)
-  #+sb-doc
   (:documentation
    "Return a form which, when evaluated in the lexical environment
 described by ENVIRONMENT, parses the specializer SPECIALIZER-NAME and
@@ -431,7 +450,6 @@ protocol. Interface subject to change."))
 (defgeneric make-method-lambda-using-specializers
     (proto-generic-function proto-method qualifiers specializers
      method-lambda environment)
-  #+sb-doc
   (:documentation
    "Compute a method lambda form based on METHOD-LAMBDA, possibly
 taking into account PROTO-GENERIC-FUNCTION, PROTO-METHOD, QUALIFIERS,

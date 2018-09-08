@@ -52,3 +52,7 @@
                                        (cons symbol null))))
             (assert (typep name '(cons (eql :macro)
                                        (cons symbol null)))))))))
+
+(with-test (:name :fdefinition-no-consing
+            :skipped-on :interpreter)
+  (ctu:assert-no-consing (fdefinition 'list)))

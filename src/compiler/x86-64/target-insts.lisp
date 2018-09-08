@@ -15,9 +15,57 @@
 
 (in-package "SB!X86-64-ASM")
 
+;;; Return the operand size depending on the prefixes and width bit as
+;;; stored in DSTATE.
+(defun inst-operand-size (dstate)
+  (declare (type disassem-state dstate))
+  (cond ((dstate-getprop dstate +operand-size-8+) :byte)
+        ((dstate-getprop dstate +rex-w+) :qword)
+        ((dstate-getprop dstate +operand-size-16+) :word)
+        (t +default-operand-size+)))
+
+;;; The same as INST-OPERAND-SIZE, but for those instructions (e.g.
+;;; PUSH, JMP) that have a default operand size of :qword. It can only
+;;; be overwritten to :word.
+(defun inst-operand-size-default-qword (dstate)
+  (declare (type disassem-state dstate))
+  (if (dstate-getprop dstate +operand-size-16+) :word :qword))
+
+;;; This prefilter is used solely for its side effect, namely to put
+;;; the property OPERAND-SIZE-8 into the DSTATE if VALUE is 0.
+(defun prefilter-width (dstate value)
+  (declare (type bit value) (type disassem-state dstate))
+  (when (zerop value)
+    (dstate-setprop dstate +operand-size-8+))
+  value)
+
+;;; A register field that can be extended by REX.R.
+;;; As noted in 'insts', this prefilter (and others) could return a REG.
+(defun prefilter-reg-r (dstate value)
+  (declare (type (mod 8) value) (type disassem-state dstate))
+  (if (dstate-getprop dstate +rex-r+) (+ value 8) value))
+
+;;; A register field that can be extended by REX.B.
+(defun prefilter-reg-b (dstate value)
+  (declare (type (mod 8) value) (type disassem-state dstate))
+  (if (dstate-getprop dstate +rex-b+) (+ value 8) value))
+
+;; This reader extracts the 'imm' operand in "MOV reg,imm" format.
+;; KLUDGE: the REG instruction format can not define a reader
+;; because it has no field specification and no prefilter.
+;; (It's specified directly in the MOV instruction definition)
+(defun reg-imm-data (dchunk dstate) dchunk
+  (aref (sb!disassem::dstate-filtered-values dstate) 4))
+
+(defun regrm-inst-reg (dchunk dstate)
+  (logior (if (logtest (sb!disassem::dstate-inst-properties dstate) +rex-r+) 8 0)
+          (!regrm-inst-reg dchunk dstate)))
+(defun ext-regrm-inst-reg (dchunk dstate)
+  (logior (if (logtest (sb!disassem::dstate-inst-properties dstate) +rex-r+) 8 0)
+          (!ext-regrm-inst-reg dchunk dstate)))
+
 (defstruct (machine-ea (:include sb!disassem::filtered-arg)
                        (:copier nil)
-                       (:predicate nil)
                        (:constructor %make-machine-ea))
   base disp index scale)
 
@@ -31,13 +79,13 @@
            (type disassem-state dstate))
   (princ (if (and (eq width :byte)
                   (<= 4 value 7)
-                  (not (dstate-get-inst-prop dstate +rex+)))
-             (aref *high-byte-reg-names* (- value 4))
+                  (not (dstate-getprop dstate +rex+)))
+             (aref #("AH" "CH" "DH" "BH") (- value 4))
              (aref (ecase width
-                     (:byte *byte-reg-names*)
-                     (:word *word-reg-names*)
-                     (:dword *dword-reg-names*)
-                     (:qword *qword-reg-names*))
+                     (:byte sb!vm::+byte-register-names+)
+                     (:word sb!vm::+word-register-names+)
+                     (:dword sb!vm::+dword-register-names+)
+                     (:qword sb!vm::+qword-register-names+))
                    value))
          stream)
   ;; XXX plus should do some source-var notes
@@ -59,7 +107,7 @@
 ;; Avoid use of INST-OPERAND-SIZE because it's wrong for this type of operand.
 (defun print-d/q-word-reg (value stream dstate)
   (print-reg-with-width value
-                        (if (dstate-get-inst-prop dstate +rex-w+) :qword :dword)
+                        (if (dstate-getprop dstate +rex-w+) :qword :dword)
                         stream
                         dstate))
 
@@ -98,6 +146,9 @@
   (print-reg/mem-with-width
    value (inst-operand-size-default-qword dstate) t stream dstate))
 
+(defun print-jmp-ea (value stream dstate)
+  (print-sized-reg/mem-default-qword value stream dstate))
+
 (defun print-sized-byte-reg/mem (value stream dstate)
   (print-reg/mem-with-width value :byte t stream dstate))
 
@@ -121,13 +172,15 @@
       (print-mem-ref :ref value nil stream dstate)))
 
 (defun print-imm/asm-routine (value stream dstate)
-  (maybe-note-assembler-routine value nil dstate)
-  (maybe-note-static-symbol value dstate)
-  (princ value stream))
+  (if (or #!+immobile-space (maybe-note-lisp-callee value dstate)
+          (maybe-note-assembler-routine value nil dstate)
+          (maybe-note-static-symbol value dstate))
+      (princ16 value stream)
+      (princ value stream)))
 
 ;;; Return either a MACHINE-EA or a register (a fixnum).
-;;; VALUE is a list of the mod and r/m fields of the instruction's ModRM byte.
-;;; Depending on VALUE, a SIB byte and/or displacement may be read.
+;;; MOD and R/M are the extracted bits from the instruction's ModRM byte.
+;;; Depending on MOD and R/M, a SIB byte and/or displacement may be read.
 ;;; The REX.B and REX.X from dstate are appropriately consumed.
 (defun prefilter-reg/mem (dstate mod r/m)
   (declare (type disassem-state dstate)
@@ -146,8 +199,7 @@
              (#b01 (read-signed-suffix 8 dstate))
              (#b10 (read-signed-suffix 32 dstate))))
          (extend (bit-name reg)
-           (logior (if (dstate-get-inst-prop dstate bit-name) 8 0)
-                   reg)))
+           (logior (if (dstate-getprop dstate bit-name) 8 0) reg)))
     (declare (inline extend))
     (let ((full-reg (extend +rex-b+ r/m)))
       (cond ((= mod #b11) full-reg) ; register direct mode
@@ -166,6 +218,33 @@
             ;; rex.b is not decoded in determining RIP-relative mode
             ((= r/m #b101) (make-machine-ea :rip (read-signed-suffix 32 dstate)))
             (t (make-machine-ea full-reg))))))
+
+#!+sb-thread
+(defun static-symbol-from-tls-index (index)
+  (dovector (sym +static-symbols+)
+    (when (= (symbol-tls-index sym) index)
+      (return sym))))
+
+;;; Return contents of memory if either it refers to an unboxed code constant
+;;; or is RIP-relative with a displacement of 0.
+(defun unboxed-constant-ref (dstate segment-offset addr disp)
+  ;; FIXME: why in one case do we read via SEGMENT-SAP and the other via ADDR?
+  (cond ((< segment-offset
+            (sb!disassem::seg-initial-raw-bytes (dstate-segment dstate)))
+         (sap-ref-word (dstate-segment-sap dstate) segment-offset))
+        ((eql disp 0)
+            ;; Assume this is safe to read, since we're disassembling
+            ;; from the memory just a few bytes preceding 'addr'.
+         (sap-ref-word (int-sap addr) 0))))
+
+(define-load-time-global thread-slot-names
+    (let* ((slots (primitive-object-slots
+                   (find 'sb!vm::thread *primitive-objects*
+                         :key #'primitive-object-name)))
+           (a (make-array (1+ (slot-offset (car (last slots))))
+                          :initial-element nil)))
+      (dolist (slot slots a)
+        (setf (aref a (slot-offset slot)) (slot-name slot)))))
 
 ;;; Prints a memory reference to STREAM. VALUE is a list of
 ;;; (BASE-REG OFFSET INDEX-REG INDEX-SCALE), where any component may be
@@ -196,6 +275,8 @@
     (when (and width (eq mode :sized-ref))
       (princ width stream)
       (princ '| PTR | stream))
+    (when (dstate-getprop dstate +fs-segment+)
+      (princ "FS:" stream))
     (write-char #\[ stream)
     (when base-reg
       (if (eql :rip base-reg)
@@ -214,65 +295,76 @@
       (unless (or firstp (minusp disp))
         (write-char #\+ stream))
       (cond ((eq (machine-ea-base value) :rip)
-             (princ disp stream)
-             (unless (eq mode :compute)
-               (let ((addr (+ disp (dstate-next-addr dstate))))
-                 ;; The origin is zero when disassembling into a trace-file.
-                 ;; Don't crash on account of it.
-                 (when (plusp addr)
-                   (or (nth-value
-                        1 (note-code-constant-absolute addr dstate width))
-                       (maybe-note-assembler-routine addr nil dstate)
-                       ;; Show the absolute address and maybe the contents.
-                       (note (format nil "[#x~x]~@[ = ~x~]"
-                                     addr
-                                     (case width
-                                       (:qword
-                                        (unboxed-constant-ref
-                                         dstate
-                                         (+ (dstate-next-offs dstate) disp)))))
-                             dstate))))))
+             (princ disp stream))
             (firstp
                (princ16 disp stream)
                (or (minusp disp)
                    (nth-value 1 (note-code-constant-absolute disp dstate))
                    (maybe-note-assembler-routine disp nil dstate)
-                   ;; Static symbols coming frorm CELL-REF
+                   ;; Static symbols coming from CELL-REF
                    (maybe-note-static-symbol (+ disp (- other-pointer-lowtag
                                                         n-word-bytes))
                                              dstate)))
             (t
              (princ disp stream))))
     (write-char #\] stream)
+    (when (and (eq (machine-ea-base value) :rip) (neq mode :compute))
+      ;; Always try to print the EA as a note
+      (let ((addr (+ disp (dstate-next-addr dstate))))
+        ;; The origin is zero when disassembling into a trace-file.
+        ;; Don't crash on account of it.
+        (when (plusp addr)
+          (or (nth-value
+               1 (note-code-constant-absolute addr dstate width))
+              (maybe-note-assembler-routine addr nil dstate)
+              ;; Show the absolute address and maybe the contents.
+              (note (format nil "[#x~x]~@[ = #x~x~]"
+                            addr
+                            (case width
+                              (:qword
+                               (unboxed-constant-ref
+                                dstate
+                                (+ (dstate-next-offs dstate) disp)
+                                addr disp))))
+                    dstate)))))
     #!+sb-thread
-    (when (and (eql base-reg #.(ash (tn-offset sb!vm::thread-base-tn) -1))
-               (not index-reg) ; no index
-               (typep disp '(integer 0 *)) ; positive displacement
-               (seg-code (dstate-segment dstate)))
+    (flet ((guess-symbol (predicate)
+             (binding* ((code-header (seg-code (dstate-segment dstate)) :exit-if-null)
+                        (header-n-words (code-header-words code-header)))
+               (loop for word-num from code-constants-offset below header-n-words
+                     for obj = (code-header-ref code-header word-num)
+                     when (and (symbolp obj) (funcall predicate obj))
+                     do (return obj)))))
       ;; Try to reverse-engineer which thread-local binding this is
-      (let* ((code (seg-code (dstate-segment dstate)))
-             (header-n-words (code-header-words code))
-             (tls-index (ash disp (- n-fixnum-tag-bits))))
-        (loop for word-num from code-constants-offset below header-n-words
-              for obj = (code-header-ref code word-num)
-              when (and (symbolp obj) (= (symbol-tls-index obj) tls-index))
-              do (return-from print-mem-ref
-                   (note (lambda (stream) (format stream "tls: ~S" obj))
-                         dstate))))
-      ;; Or maybe we're looking at the 'struct thread' itself
-      (when (< disp max-interrupts)
-        (let* ((thread-slots
-                (load-time-value
-                 (primitive-object-slots
-                  (find 'sb!vm::thread *primitive-objects*
-                        :key #'primitive-object-name)) t))
-               (slot (find (ash disp (- word-shift)) thread-slots
-                           :key #'slot-offset)))
-          (when slot
-            (return-from print-mem-ref
-              (note (lambda (stream)
-                      (format stream "thread.~(~A~)" (slot-name slot)))
-                    dstate))))))))
+      (cond ((and disp ; Test whether disp looks aligned to an object header
+                  (not (logtest (- disp 4) sb!vm:lowtag-mask))
+                  (not base-reg) (not index-reg))
+             (let* ((addr (+ disp (- 4) sb!vm:other-pointer-lowtag))
+                    (symbol
+                     (guess-symbol (lambda (s) (= (get-lisp-obj-address s) addr)))))
+               (when symbol
+                 (note (lambda (stream) (format stream "tls_index: ~S" symbol))
+                       dstate))))
+            ((and (eql base-reg #.(ash (tn-offset sb!vm::thread-base-tn) -1))
+                  (not (dstate-getprop dstate +fs-segment+)) ; not system TLS
+                  (not index-reg) ; no index
+                  (typep disp '(integer 0 *)) ; positive displacement
+                  (zerop (logand disp 7))) ; lispword-aligned
+             (let ((index (ash disp -3)))
+               (when (< index (length thread-slot-names))
+                 (awhen (aref thread-slot-names index)
+                   (return-from print-mem-ref
+                     (note (lambda (stream) (format stream "thread.~(~A~)" it))
+                           dstate)))))
+             (let* ((tls-index (ash disp (- n-fixnum-tag-bits)))
+                    (symbol (or (guess-symbol
+                                 (lambda (s) (= (symbol-tls-index s) tls-index)))
+                                ;; static symbols aren't in the code header
+                                (static-symbol-from-tls-index tls-index))))
+               (when symbol
+                 (return-from print-mem-ref
+                   (note (lambda (stream) (format stream "tls: ~S" symbol))
+                         dstate)))))))))
 
 (defun lea-compute-label (value dstate)
   ;; If VALUE should be regarded as a label, return the address.
@@ -310,139 +402,53 @@
        ;; But ordinarily we get the string. Either way, the r/m arg reveals the
        ;; EA calculation. DCHUNK-ZERO is a meaningless value - any would do -
        ;; because the EA was computed in a prefilter.
-       (print-mem-ref :compute (reg-r/m-inst-r/m-arg dchunk-zero dstate)
+       (print-mem-ref :compute (regrm-inst-r/m dchunk-zero dstate)
                       width stream dstate)
        (setq addr value)
        (when (stringp value) (setq fmt "= ~A"))))
     (when addr
-      (note (lambda (s) (format s fmt addr)) dstate))))
-
-(defun unboxed-constant-ref (dstate segment-offset)
-  (let* ((seg (dstate-segment dstate))
-         (code-offset
-          (sb!disassem::segment-offs-to-code-offs segment-offset seg))
-         (unboxed-range (sb!disassem::seg-unboxed-data-range seg)))
-    (and unboxed-range
-         (<= (car unboxed-range) code-offset (cdr unboxed-range))
-         (sap-ref-int (dstate-segment-sap dstate)
-                      segment-offset n-word-bytes
-                      (dstate-byte-order dstate)))))
+      (unless (maybe-note-assembler-routine addr nil dstate)
+        (note (lambda (s) (format s fmt addr)) dstate)))))
 
 ;;;; interrupt instructions
 
 (defun break-control (chunk inst stream dstate)
   (declare (ignore inst))
   (flet ((nt (x) (if stream (note x dstate))))
-    (case #!-ud2-breakpoints (byte-imm-code chunk dstate)
-          #!+ud2-breakpoints (word-imm-code chunk dstate)
-      (#.error-trap
-       (nt "error trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.cerror-trap
-       (nt "cerror trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.breakpoint-trap
-       (nt "breakpoint trap"))
-      (#.pending-interrupt-trap
-       (nt "pending interrupt trap"))
-      (#.halt-trap
-       (nt "halt trap"))
-      (#.fun-end-breakpoint-trap
-       (nt "function end breakpoint trap"))
-      (#.single-step-around-trap
-       (nt "single-step trap (around)"))
-      (#.single-step-before-trap
-       (nt "single-step trap (before)"))
-      (#.invalid-arg-count-trap
-       (nt "Invalid argument count trap")))))
+    (let ((trap #!-ud2-breakpoints (byte-imm-code chunk dstate)
+           #!+ud2-breakpoints (word-imm-code chunk dstate)))
+     (case trap
+       (#.breakpoint-trap
+        (nt "breakpoint trap"))
+       (#.pending-interrupt-trap
+        (nt "pending interrupt trap"))
+       (#.halt-trap
+        (nt "halt trap"))
+       (#.fun-end-breakpoint-trap
+        (nt "function end breakpoint trap"))
+       (#.single-step-around-trap
+        (nt "single-step trap (around)"))
+       (#.single-step-before-trap
+        (nt "single-step trap (before)"))
+       (#.invalid-arg-count-trap
+        (nt "Invalid argument count trap"))
+       (#.cerror-trap
+        (nt "cerror trap")
+        (handle-break-args #'snarf-error-junk trap stream dstate))
+       (t
+        (handle-break-args #'snarf-error-junk trap stream dstate))))))
 
-;;;;
-
-#!+immobile-code
-(defun sb!vm::collect-immobile-code-relocs ()
-  (let ((code-components
-         (make-array 20000 :element-type '(unsigned-byte 32)
-                           :fill-pointer 0 :adjustable t))
-        (relocs
-         (make-array 100000 :element-type '(unsigned-byte 32)
-                            :fill-pointer 0 :adjustable t))
-        ;; Look for these two instruction formats.
-        (jmp-inst (find-inst #b11101001 (get-inst-space)))
-        (call-inst (find-inst #b11101000 (get-inst-space)))
-        (seg (sb!disassem::%make-segment
-              :sap-maker #'error :virtual-location 0))
-        (dstate (make-dstate)))
-    (flet ((scan-function (fun-entry-addr fun-end-addr predicate)
-             (setf (seg-virtual-location seg) fun-entry-addr
-                   (seg-length seg) (- fun-end-addr fun-entry-addr)
-                   (seg-sap-maker seg)
-                   (let ((sap (int-sap fun-entry-addr))) (lambda () sap)))
-             (map-segment-instructions
-              (lambda (dchunk inst)
-                (when (and (or (eq inst jmp-inst)
-                               (eq inst call-inst))
-                           (funcall predicate
-                                    (+ (sb!disassem::sign-extend
-                                        (ldb (byte 32 8) dchunk) 32)
-                                       (dstate-next-addr dstate))))
-                  (vector-push-extend (dstate-cur-addr dstate) relocs)))
-              seg dstate nil))
-           (finish-component (code start-relocs-index)
-             (when (> (fill-pointer relocs) start-relocs-index)
-               (vector-push-extend (get-lisp-obj-address code) code-components)
-               (vector-push-extend start-relocs-index code-components))))
-
-      ;; Assembler routines are in read-only space, and they can have
-      ;; relative jumps to immobile space.
-      ;; Since these code components do not contain simple-funs,
-      ;; we have to group the routines by looking at addresses.
-      (let ((asm-routines
-             (mapcar #'cdr (%hash-table-alist sb!fasl:*assembler-routines*)))
-            code-components)
-        (sb!vm::map-allocated-objects (lambda (obj type size)
-                                        (declare (ignore type size))
-                                        (push obj code-components))
-                                      :read-only)
-        (dolist (code (nreverse code-components))
-          (let* ((text-origin (sap-int (code-instructions code)))
-                 (text-end (+ text-origin (%code-code-size code)))
-                 (relocs-index (fill-pointer relocs)))
-            (mapl (lambda (list)
-                    (scan-function (car list)
-                                   (if (cdr list) (cadr list) text-end)
-                                   ;; Look for transfers into immobile code
-                                   (lambda (jmp-targ-addr)
-                                     (<= sb!vm:immobile-space-start
-                                         jmp-targ-addr sb!vm:immobile-space-end))))
-                  (sort (remove-if-not (lambda (address)
-                                         (<= text-origin address text-end))
-                                       asm-routines) #'<))
-            (finish-component code relocs-index))))
-
-      ;; Immobile space - code components can jump to immobile space,
-      ;; read-only space, and C runtime routines.
-      (sb!vm::map-allocated-objects
-       (lambda (code type size)
-         (declare (ignore size))
-         (when (= type code-header-widetag)
-           (let* ((text-origin (sap-int (code-instructions code)))
-                  (text-end (+ text-origin (%code-code-size code)))
-                  (relocs-index (fill-pointer relocs)))
-             (dotimes (i (code-n-entries code) (finish-component code relocs-index))
-               (let ((fun (%code-entry-point code i)))
-                 (scan-function
-                  (+ (get-lisp-obj-address fun) (- fun-pointer-lowtag)
-                     (ash simple-fun-code-offset word-shift))
-                  (if (< (1+ i) (code-n-entries code))
-                      (- (get-lisp-obj-address (%code-entry-point code (1+ i)))
-                         fun-pointer-lowtag)
-                      text-end)
-                ;; Exclude transfers within this code component
-                  (lambda (jmp-targ-addr)
-                    (not (<= text-origin jmp-targ-addr text-end)))))))))
-       :immobile))
-
-    ;; Write a delimiter into the array passed to C
-    (vector-push-extend 0 code-components)
-    (vector-push-extend (fill-pointer relocs) code-components)
-    (values code-components relocs)))
+(defun sb!c::convert-alloc-point-fixups (code locs)
+  ;; Find the instruction which jumps over the profiling code,
+  ;; and record the offset, and not the instruction that makes the call
+  ;; to enable the counter. The instructions preceding the call comprise
+  ;; a test, jmp, and long nop. Luckily a long nop encoding never
+  ;; has the byte #xEB in it, so just scan backwards looking for that.
+  (pack-code-fixup-locs
+   (mapcar (lambda (loc)
+             (loop (cond ((zerop (decf loc))
+                          (bug "Failed to find allocation point"))
+                         ((eql (sap-ref-8 (code-instructions code) loc) #xEB)
+                          (return loc)))))
+           locs)
+   nil))

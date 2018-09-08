@@ -24,12 +24,10 @@
   (values))
 
 (defvar *inspect-fun* #'inspector
-  #+sb-doc
   "A function of three arguments OBJECT, INPUT, and OUTPUT which starts an interactive inspector.")
 
 (defvar *inspected*)
 
-#+sb-doc
 (setf (documentation '*inspected* 'variable)
       "the value currently being inspected in CL:INSPECT")
 
@@ -119,17 +117,21 @@ evaluated expressions.
     (format stream "~&~{~S~%~}" result-list)))
 
 (defun tty-display-inspected-parts (description named-p elements stream)
-  (format stream "~%~A" description)
-  (let ((index 0))
-    (dolist (element elements)
-      (if named-p
-          (destructuring-bind (name . value) element
-            (format stream "~W. ~A: ~W~%" index name
-                    (if (eq value *inspect-unbound-object-marker*)
-                        "unbound"
-                        value)))
-          (format stream "~W. ~W~%" index element))
-      (incf index))))
+  (let ((*suppress-print-errors*
+         (if (subtypep 'serious-condition *suppress-print-errors*)
+             *suppress-print-errors*
+             'serious-condition)))
+    (format stream "~%~A" description)
+    (loop for element in elements
+       for index from 0
+       do (multiple-value-bind (value name)
+              (if named-p
+                  (values (cdr element) (car element))
+                  element)
+            (format stream "~W. ~@[~A: ~]~W~%"
+                    index name (if (eq value *inspect-unbound-object-marker*)
+                                   "unbound"
+                                   value))))))
 
 ;;;; INSPECTED-PARTS
 
@@ -223,22 +225,9 @@ evaluated expressions.
              (list
               (cons "Closed over values" (%closure-values object)))))))
 
-#+sb-eval
-(defmethod inspected-parts ((object sb-eval:interpreted-function))
-  (multiple-value-bind (defn closurep name) (function-lambda-expression object)
-    (declare (ignore closurep))
-    (values (format nil "The object is an interpreted function named ~S.~%" name)
-            t
-            ;; Defined-from stuff used to be here. Someone took
-            ;; it out. FIXME: We should make it easy to get
-            ;; to DESCRIBE from the inspector.
-            (list
-             (cons "Lambda-list" (sb-eval:interpreted-function-lambda-list object))
-             (cons "Definition" defn)
-             (cons "Documentation" (sb-eval:interpreted-function-documentation object))))))
-
-#+sb-fasteval
-(defmethod inspected-parts ((object sb-interpreter:interpreted-function))
+#+(or sb-eval sb-fasteval)
+(defmethod inspected-parts ((object #+sb-fasteval sb-interpreter:interpreted-function
+                                    #+sb-eval sb-eval:interpreted-function))
   (multiple-value-bind (defn closurep name) (function-lambda-expression object)
     (declare (ignore closurep))
     (values (format nil "The object is an interpreted function named ~S.~%" name)
@@ -249,7 +238,7 @@ evaluated expressions.
             (list
              (cons "Lambda-list" (%fun-lambda-list object))
              (cons "Definition" defn)
-             (cons "Documentation" (%fun-doc object))))))
+             (cons "Documentation" (documentation object t))))))
 
 (defmethod inspected-parts ((object vector))
   (values (format nil

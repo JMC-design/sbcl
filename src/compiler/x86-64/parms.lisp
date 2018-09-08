@@ -13,6 +13,39 @@
 
 (in-package "SB!VM")
 
+(defconstant sb!assem:assem-scheduler-p nil)
+(defconstant sb!assem:+inst-alignment-bytes+ 1)
+
+(defconstant +backend-fasl-file-implementation+ :x86-64)
+(defconstant-eqx +fixup-kinds+ #(:absolute :relative :absolute64)
+  #'equalp)
+
+;;; KLUDGE: It would seem natural to set this by asking our C runtime
+;;; code for it, but mostly we need it for GENESIS, which doesn't in
+;;; general have our C runtime code running to ask, so instead we set
+;;; it by hand. -- WHN 2001-04-15
+;;;
+;;; Actually any information that we can retrieve C-side would be
+;;; useless in SBCL, since it's possible for otherwise binary
+;;; compatible systems to return different values for getpagesize().
+;;; -- JES, 2007-01-06
+(defconstant +backend-page-bytes+ #!+win32 65536 #!-win32 32768)
+
+;;; The size in bytes of GENCGC cards, i.e. the granularity at which
+;;; writes to old generations are logged.  With mprotect-based write
+;;; barriers, this must be a multiple of the OS page size.
+(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The minimum size of new allocation regions.  While it doesn't
+;;; currently make a lot of sense to have a card size lower than
+;;; the alloc granularity, it will, once we are smarter about finding
+;;; the start of objects.
+(defconstant gencgc-alloc-granularity 0)
+;;; The minimum size at which we release address ranges to the OS.
+;;; This must be a multiple of the OS page size.
+(defconstant gencgc-release-granularity +backend-page-bytes+)
+;;; The card size for immobile/low space
+(defconstant immobile-card-bytes 4096)
+
 ;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
 ;;; and a 16 bit quantity depending on context. This is because Intel
 ;;; insists on calling 16 bit things words and 32 bit things
@@ -30,10 +63,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 64)
-
-;;; the number of bits per byte, where a byte is the smallest
-;;; addressable object
-(defconstant n-byte-bits 8)
 
 ;;; The minimum immediate offset in a memory-referencing instruction.
 (defconstant minimum-immediate-offset (- (expt 2 31)))
@@ -108,28 +137,24 @@
 
 (!gencgc-space-setup #x20000000
                      :dynamic-space-start #x1000000000
-
-                     #!+openbsd :default-dynamic-space-size #!+openbsd #x1bcf0000
-
-                     #!+win32 :alignment #!+win32 #x10000)
+                     #!+openbsd :dynamic-space-size #!+openbsd #x1bcf0000)
 
 (defconstant linkage-table-entry-size 16)
 
 
-;;;; other miscellaneous constants
-
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
   invalid-arg-count-trap
+  memory-fault-emulation-trap
   #!+sb-safepoint global-safepoint-trap
-  #!+sb-safepoint csp-safepoint-trap)
+  #!+sb-safepoint csp-safepoint-trap
+  error-trap)
 
 ;;;; static symbols
 
@@ -144,46 +169,22 @@
 ;;; we could profitably keep these in registers on x86-64 now we have
 ;;; r8-r15 as well
 ;;;     Note these spaces grow from low to high addresses.
-(defvar *allocation-pointer*)
 (defvar *binding-stack-pointer*)
 
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '(*alien-stack-pointer*
-
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+
+    #!+(and immobile-space (not sb-thread)) function-layout
+    #!-sb-thread *alien-stack-pointer*    ; a thread slot if #!+sb-thread
      ;; interrupt handling
-     *pseudo-atomic-bits*
-
-     *allocation-pointer*
-     *binding-stack-pointer*
-
-     ;; For GC-AND-SAVE
-     *restart-lisp-function*
-
-     ;; Needed for callbacks to work across saving cores. see
-     ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory
-     ;; details.
-     sb!alien::*enter-alien-callback*
-
-     ;; hash table empty cell marker
-     sb!impl::%empty-ht-slot%
-
-     ;; The ..SLOT-UNBOUND.. symbol is static in order to optimise the
-     ;; common slot unbound check.
-     ;;
-     ;; FIXME: In SBCL, the CLOS code has become sufficiently tightly
-     ;; integrated into the system that it'd probably make sense to
-     ;; use the ordinary unbound marker for this.
-     ;;
-     ;; FIXME II: if it doesn't make sense, why is this X86-ish only?
-     sb!pcl::..slot-unbound..)))
+    #!-sb-thread *pseudo-atomic-bits*     ; ditto
+    #!-sb-thread *binding-stack-pointer* ; ditto
+    *cpuid-fn1-ecx*)
+  #'equalp)
 
 ;;; FIXME: with #!+immobile-space, this should be the empty list,
 ;;; because *all* fdefns are permanently placed.
-(defparameter *static-funs*
-  '(length
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -198,7 +199,8 @@
     two-arg-xor
     two-arg-gcd
     two-arg-lcm
-    %coerce-callable-to-fun))
+    %coerce-callable-to-fun)
+  #'equalp)
 
 #!+sb-simd-pack
 (defvar *simd-pack-element-types* '(integer single-float double-float))

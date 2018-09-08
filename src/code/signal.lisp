@@ -48,10 +48,12 @@
 ;;;    (foo))
 ;;; provided that the first branch is true "often enough".
 
-(!defvar *interrupts-enabled* t)
-(!defvar *interrupt-pending* nil)
-#!+sb-thruption (!defvar *thruption-pending* nil)
-(!defvar *allow-with-interrupts* t)
+;;; These 4 symbols are initialized by create_thread_struct()
+(defvar *interrupts-enabled*)
+(defvar *interrupt-pending*)
+#!+sb-thruption (defvar *thruption-pending*)
+(defvar *allow-with-interrupts*)
+
 ;;; This is to support signal handlers that want to return to the
 ;;; interrupted context without leaving anything extra on the stack. A
 ;;; simple
@@ -65,8 +67,19 @@
 ;;; still on the stack.
 (!defvar *unblock-deferrables-on-enabling-interrupts-p* nil)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (dolist (symbol '(*unblock-deferrables-on-enabling-interrupts-p*
+                    *interrupts-enabled*
+                    *interrupt-pending*
+                    #!+sb-thruption *thruption-pending*
+                    *allow-with-interrupts*))
+    ;; Force these to be always bound despite absence of a compile-time binding.
+    ;; (Avoid accidentally installing a value into symbol->value in cold-load)
+    ;; Not only are they always bound, 4 of them always have a thread-local value.
+    ;; We don't as yet have a way to elide the check for no-tls-value though.
+    (setf (info :variable :always-bound symbol) :always-bound)))
+
 (defmacro without-interrupts (&body body)
-  #!+sb-doc
   "Executes BODY with all deferrable interrupts disabled. Deferrable
 interrupts arriving during execution of the BODY take effect after BODY has
 been executed.
@@ -112,21 +125,15 @@ WITHOUT-INTERRUPTS in:
                      `(let ((*allow-with-interrupts*
                              ,',outer-allow-with-interrupts))
                         ,@allow-forms))
-                   (with-local-interrupts
-                     (&body with-forms)
-                     `(let ((*allow-with-interrupts*
-                             ,',outer-allow-with-interrupts)
-                            (*interrupts-enabled*
-                             ,',outer-allow-with-interrupts))
-                        (when ,',outer-allow-with-interrupts
-                          (when *unblock-deferrables-on-enabling-interrupts-p*
-                            (setq *unblock-deferrables-on-enabling-interrupts-p*
-                                  nil)
-                            (sb!unix::unblock-deferrable-signals))
-                          (when (or *interrupt-pending*
-                                    #!+sb-thruption *thruption-pending*)
-                            (receive-pending-interrupt)))
-                        (locally ,@with-forms))))
+                   (with-local-interrupts (&body body)
+                     `(dx-flet ((body () ,@body))
+                        (let ((*allow-with-interrupts*
+                                ,',outer-allow-with-interrupts)
+                              (*interrupts-enabled*
+                                ,',outer-allow-with-interrupts))
+                          (with-deferrable-signals-unblocked
+                            ,',outer-allow-with-interrupts
+                            #'body)))))
                 (let ((*interrupts-enabled* nil)
                       (,outer-allow-with-interrupts *allow-with-interrupts*)
                       (*allow-with-interrupts* nil))
@@ -152,7 +159,6 @@ WITHOUT-INTERRUPTS in:
            (,without-interrupts-body)))))
 
 (defmacro with-interrupts (&body body)
-  #!+sb-doc
   "Executes BODY with deferrable interrupts conditionally enabled. If there
 are pending interrupts they take effect prior to executing BODY.
 
@@ -168,14 +174,10 @@ by ALLOW-WITH-INTERRUPTS."
     `(let* ((,allowp *allow-with-interrupts*)
             (,enablep *interrupts-enabled*)
             (*interrupts-enabled* (or ,enablep ,allowp)))
-       (when (and ,allowp (not ,enablep))
-         (when *unblock-deferrables-on-enabling-interrupts-p*
-           (setq *unblock-deferrables-on-enabling-interrupts-p* nil)
-           (sb!unix::unblock-deferrable-signals))
-         (when (or *interrupt-pending*
-                   #!+sb-thruption *thruption-pending*)
-           (receive-pending-interrupt)))
-       (locally ,@body))))
+       (dx-flet ((body () ,@body))
+         (with-deferrable-signals-unblocked
+             (and ,allowp (not ,enablep))
+           #'body)))))
 
 (defmacro allow-with-interrupts (&body body)
   (declare (ignore body))

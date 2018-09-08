@@ -86,7 +86,7 @@ you deserve to lose.")
 (defparameter *symbol-characters* "ABCDEFGHIJKLMNOPQRSTUVWXYZ*:-+&#'"
   "List of characters that make up symbols in a docstring.")
 
-(defparameter *symbol-delimiters* " ,.!?;")
+(defparameter *symbol-delimiters* " ,.!?;()")
 
 (defparameter *ordered-documentation-kinds*
   '(package type structure condition class macro))
@@ -869,7 +869,7 @@ package, as well as for the package itself."
   (format *texinfo-output* "~
 @iftex
 @macro ~A{name}
-{\\\\smallertt\\\\phantom{concurrency:}~@[\\\\llap{~(~A~):}~]}\\name\\
+{@smallertt@phantom{concurrency:}~@[@llap{~(~A~):}~]}\\name\\
 @end macro
 @end iftex
 @ifinfo

@@ -107,7 +107,8 @@
    ("A function with declared result type NIL returned." nil-fun-returned 1)
    ("An array with element-type NIL was accessed." nil-array-accessed 1)
    ("Object layout is invalid. (indicates obsolete instance)" layout-invalid 2)
-   ("Thread local storage exhausted." tls-exhausted 0))
+   ("Thread local storage exhausted." tls-exhausted 0)
+   ("Failed aver" failed-aver 1))
 
   ;; (II) All the type specifiers X for which there is a unique internal
   ;;      error code corresponding to a primitive object-not-X-error.
@@ -153,12 +154,23 @@
   #!+sb-simd-pack simd-pack
   weak-pointer
   instance
+  #!+sb-unicode
   character
+  base-char
   ((and vector (not simple-array)) object-not-complex-vector)
+
+  ;; This "type" is used for checking that a structure slot has a value,
+  ;; which it may not if a BOA constructor failed to initialize it.
+  ;; The compiler knows to translate the SATISFIES test with a vop,
+  ;; and knows to emit the specific error number for this type
+  ;; rather than using the strange type name. The INTERNAL-ERROR function
+  ;; receives the trap number as if it were a type error,
+  ;; but prints a better message than "is not a (not satisfies)"
+  ((not (satisfies sb!vm::unbound-marker-p)) slot-not-initialized)
 
   ;; Now, in approximate order of descending popularity.
   ;; If we exceed 255 error numbers, trailing ones can be deleted arbitrarily.
-  (sb!c:sc object-not-storage-class) ; the single most popular type
+  sb!c:storage-class ; the single most popular type
   sb!c:tn-ref
   index
   ctype
@@ -214,8 +226,18 @@
       0))
 
 #-sb-xc-host ; no SB!C:SAP-READ-VAR-INTEGERF
-(defun decode-internal-error-args (sap error-number)
-  (let ((length (sb!kernel::error-length error-number)))
-    (declare (type (unsigned-byte 8) length))
-    (loop repeat length with index = 0
-       collect (sb!c:sap-read-var-integerf sap index))))
+(defun decode-internal-error-args (sap trap-number &optional error-number)
+  (let ((error-number (cond (error-number)
+                            ((>= trap-number sb!vm:error-trap)
+                             (prog1
+                                 (- trap-number sb!vm:error-trap)
+                               (setf trap-number sb!vm:error-trap)))
+                            (t
+                             (prog1 (sap-ref-8 sap 0)
+                               (setf sap (sap+ sap 1)))))))
+    (let ((length (sb!kernel::error-length error-number)))
+      (declare (type (unsigned-byte 8) length))
+      (values error-number
+              (loop repeat length with index = 0
+                    collect (sb!c:sap-read-var-integerf sap index))
+              trap-number))))

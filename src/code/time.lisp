@@ -15,13 +15,11 @@
   (reinit-internal-real-time))
 
 ;;; Implemented in unix.lisp and win32.lisp.
-#!+sb-doc
-(setf (fdocumentation 'get-internal-real-time 'function)
+(setf (documentation 'get-internal-real-time 'function)
       "Return the real time (\"wallclock time\") since startup in the internal
 time format. (See INTERNAL-TIME-UNITS-PER-SECOND.)")
 
 (defun get-internal-run-time ()
-  #!+sb-doc
   "Return the run time used by the process in the internal time format. (See
 INTERNAL-TIME-UNITS-PER-SECOND.) This is useful for finding CPU usage.
 Includes both \"system\" and \"user\" time."
@@ -92,13 +90,11 @@ Includes both \"system\" and \"user\" time."
 (defconstant unix-to-universal-time 2208988800)
 
 (defun get-universal-time ()
-  #!+sb-doc
   "Return a single integer for the current time of day in universal time
 format."
   (+ (get-time-of-day) unix-to-universal-time))
 
 (defun get-decoded-time ()
-  #!+sb-doc
   "Return nine values specifying the current time as follows:
    second, minute, hour, date, month, year, day of week (0 = Monday), T
    (daylight savings times) or NIL (standard time), and timezone."
@@ -110,7 +106,6 @@ format."
 (defconstant +mar-1-1903+ #.(encode-universal-time 0 0 0 1 3 1903 0))
 
 (defun years-since-mar-2000 (utime)
-  #!+sb-doc
   "Returns number of complete years since March 1st 2000, and remainder in seconds"
   (let* ((days-in-year (* 86400 365))
          (days-in-4year (+ (* 4 days-in-year) 86400))
@@ -143,7 +138,6 @@ format."
       (t unix-time))))
 
 (defun decode-universal-time (universal-time &optional time-zone)
-  #!+sb-doc
   "Converts a universal-time to decoded time format returning the following
    nine values: second, minute, hour, date, month, year, day of week (0 =
    Monday), T (daylight savings time) or NIL (standard time), and timezone.
@@ -199,7 +193,7 @@ format."
           (truncate years 100))
        (truncate (+ years 300) 400))))
 
-(defglobal **days-before-month**
+(define-load-time-global **days-before-month**
   #.(let ((reversed-result nil)
           (sum 0))
       (push nil reversed-result)
@@ -212,7 +206,6 @@ format."
 
 (defun encode-universal-time (second minute hour date month year
                                      &optional time-zone)
-  #!+sb-doc
   "The time values specified in decoded format are converted to
    universal time, which is returned."
   (declare (type (mod 60) second)
@@ -241,21 +234,19 @@ format."
     (if time-zone
         (setf encoded-time (+ second (* (+ minute (* (+ hours time-zone) 60)) 60)))
         (let* ((secwest-guess
-                (sb!unix::get-timezone
-                 (truncate-to-unix-range (* hours 60 60))))
+                 (sb!unix::get-timezone
+                  (truncate-to-unix-range (* hours 60 60))))
                (guess (+ second (* 60 (+ minute (* hours 60)))
                          secwest-guess))
                (secwest
-                (sb!unix::get-timezone
-                 (truncate-to-unix-range guess))))
+                 (sb!unix::get-timezone
+                  (truncate-to-unix-range guess))))
           (setf encoded-time (+ guess (- secwest secwest-guess)))))
-    (assert (typep encoded-time '(integer 0)))
     encoded-time))
 
 ;;;; TIME
 
 (defvar *gc-run-time* 0
-  #!+sb-doc
   "Total CPU time spent doing garbage collection (as reported by
 GET-INTERNAL-RUN-TIME.) Initialized to zero on startup. It is safe to bind
 this to zero in order to measure GC time inside a certain section of code, but
@@ -266,7 +257,11 @@ doing so may interfere with results reported by eg. TIME.")
                    gc-run-time-ms processor-cycles eval-calls
                    lambdas-converted page-faults bytes-consed
                    aborted)
-  (let ((total-run-time-us (+ user-run-time-us system-run-time-us)))
+  (let ((total-run-time-us (+ user-run-time-us system-run-time-us))
+        ;; Arbitrary truncation of the timing output is worthless,
+        ;; and it's only an artifact of the use of a single format control,
+        ;; not "by design" that it should respect *print-length*.
+        (*print-length* nil))
     (format *trace-output*
             "~&Evaluation took:~%~
                          ~@<  ~@;~/sb-impl::format-milliseconds/ of real time~%~
@@ -300,7 +295,6 @@ doing so may interfere with results reported by eg. TIME.")
             aborted)))
 
 (defmacro time (form)
-  #!+sb-doc
   "Execute FORM and print timing information on *TRACE-OUTPUT*.
 
 On some hardware platforms estimated processor cycle counts are
@@ -391,7 +385,6 @@ normally during operations like SLEEP."
 ;;; The guts of the TIME macro. Compute overheads, run the (compiled)
 ;;; function, report the times.
 (defun call-with-timing (timer function &rest arguments)
-  #!+sb-doc
   "Calls FUNCTION with ARGUMENTS, and gathers timing information about it.
 Then calls TIMER with keyword arguments describing the information collected.
 Calls TIMER even if FUNCTION performs a non-local transfer of control. Finally
@@ -430,6 +423,7 @@ returns values returned by FUNCTION.
       NIL.)
 
 EXPERIMENTAL: Interface subject to change."
+  (declare (dynamic-extent timer function))
   (let (old-run-utime
         new-run-utime
         old-run-stime
@@ -501,8 +495,8 @@ EXPERIMENTAL: Interface subject to change."
                     (note :page-faults page-faults #'zerop)
                     ;; cycle counting isn't supported everywhere.
                     (when cycles
-                      (note :processor-cycles cycles #'zerop)
-                    (note :lambdas-converted sb!c::*lambda-conversions* #'zerop))
+                      (note :processor-cycles cycles #'zerop))
+                    (note :lambdas-converted sb!c::*lambda-conversions* #'zerop)
                     (note :eval-calls *eval-calls* #'zerop)
                     (note :gc-run-time-ms gc-internal-run-time)
                     (note :system-run-time-us system-run-time)

@@ -84,7 +84,7 @@
      ;; Record references to globals made using SYMBOL-VALUE.
      (let ((fun (principal-lvar-use (combination-fun node)))
            (arg (car (combination-args node))))
-       (when (and (ref-p fun) (eq 'symbol-value (leaf-%source-name (ref-leaf fun)))
+       (when (and (ref-p fun) (eq 'symeval (leaf-%source-name (ref-leaf fun)))
                   (constant-lvar-p arg) (symbolp (lvar-value arg)))
          (record-xref :references (lvar-value arg) context node nil))))
     (ref
@@ -154,7 +154,7 @@
                           (list-all-packages))) t))
          #+sb-xc-host   ; again, special case like in genesis and dump
          (multiple-value-bind (cl-symbol cl-status)
-             (find-symbol (symbol-name what) sb!int:*cl-package*)
+             (find-symbol (symbol-name what) *cl-package*)
            (and (eq what cl-symbol) (eq cl-status :external)))))
     (t t)))
 

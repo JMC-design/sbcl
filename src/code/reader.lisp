@@ -22,8 +22,8 @@
 
 (defvar *readtable*)
 (declaim (type readtable *readtable*))
-#!+sb-doc
-(setf (fdocumentation '*readtable* 'variable)
+
+(setf (documentation '*readtable* 'variable)
       "Variable bound to current readtable.")
 
 ;;; A standard Lisp readtable (once cold-init is through). This is for
@@ -31,7 +31,7 @@
 ;;; WITH-STANDARD-IO-SYNTAX), and should not normally be user-visible.
 ;;; If the initial value is changed from NIL to something more interesting,
 ;;; be sure to update the duplicated definition in "src/code/print.lisp"
-(defglobal *standard-readtable* nil)
+(define-load-time-global *standard-readtable* nil)
 
 ;;; In case we get an error trying to parse a symbol, we want to rebind the
 ;;; above stuff so it's cool.
@@ -172,46 +172,41 @@
 ;;; There are a number of "secondary" attributes which are constant
 ;;; properties of characters (as long as they are constituents).
 
-(declaim (type attribute-table *constituent-trait-table*))
-(defglobal *constituent-trait-table*
-  (make-array base-char-code-limit
-              :element-type '(unsigned-byte 8)
-              :initial-element +char-attr-constituent+))
-
-(defun !set-constituent-trait (char trait)
-  (aver (typep char 'base-char))
-  (setf (elt *constituent-trait-table* (char-code char))
-        trait))
-
-(defun !cold-init-constituent-trait-table ()
-  (!set-constituent-trait #\: +char-attr-package-delimiter+)
-  (!set-constituent-trait #\. +char-attr-constituent-dot+)
-  (!set-constituent-trait #\+ +char-attr-constituent-sign+)
-  (!set-constituent-trait #\- +char-attr-constituent-sign+)
-  (!set-constituent-trait #\/ +char-attr-constituent-slash+)
-  (do ((i (char-code #\0) (1+ i)))
-      ((> i (char-code #\9)))
-    (!set-constituent-trait (code-char i) +char-attr-constituent-digit+))
-  (!set-constituent-trait #\E +char-attr-constituent-expt+)
-  (!set-constituent-trait #\F +char-attr-constituent-expt+)
-  (!set-constituent-trait #\D +char-attr-constituent-expt+)
-  (!set-constituent-trait #\S +char-attr-constituent-expt+)
-  (!set-constituent-trait #\L +char-attr-constituent-expt+)
-  (!set-constituent-trait #\e +char-attr-constituent-expt+)
-  (!set-constituent-trait #\f +char-attr-constituent-expt+)
-  (!set-constituent-trait #\d +char-attr-constituent-expt+)
-  (!set-constituent-trait #\s +char-attr-constituent-expt+)
-  (!set-constituent-trait #\l +char-attr-constituent-expt+)
-  (!set-constituent-trait #\Space +char-attr-invalid+)
-  (!set-constituent-trait #\Newline +char-attr-invalid+)
-  (dolist (c (list backspace-char-code tab-char-code form-feed-char-code
-                   return-char-code rubout-char-code))
-    (!set-constituent-trait (code-char c) +char-attr-invalid+)))
+(defconstant +constituent-trait-table+
+  #.(let ((a (!make-specialized-array base-char-code-limit '(unsigned-byte 8))))
+      (fill a +char-attr-constituent+)
+      (flet ((!set-constituent-trait (char trait)
+               (aver (typep char 'base-char))
+               (setf (elt a (char-code char)) trait)))
+        (!set-constituent-trait #\: +char-attr-package-delimiter+)
+        (!set-constituent-trait #\. +char-attr-constituent-dot+)
+        (!set-constituent-trait #\+ +char-attr-constituent-sign+)
+        (!set-constituent-trait #\- +char-attr-constituent-sign+)
+        (!set-constituent-trait #\/ +char-attr-constituent-slash+)
+        (do ((i (char-code #\0) (1+ i)))
+            ((> i (char-code #\9)))
+          (!set-constituent-trait (code-char i) +char-attr-constituent-digit+))
+        (!set-constituent-trait #\E +char-attr-constituent-expt+)
+        (!set-constituent-trait #\F +char-attr-constituent-expt+)
+        (!set-constituent-trait #\D +char-attr-constituent-expt+)
+        (!set-constituent-trait #\S +char-attr-constituent-expt+)
+        (!set-constituent-trait #\L +char-attr-constituent-expt+)
+        (!set-constituent-trait #\e +char-attr-constituent-expt+)
+        (!set-constituent-trait #\f +char-attr-constituent-expt+)
+        (!set-constituent-trait #\d +char-attr-constituent-expt+)
+        (!set-constituent-trait #\s +char-attr-constituent-expt+)
+        (!set-constituent-trait #\l +char-attr-constituent-expt+)
+        (!set-constituent-trait #\Space +char-attr-invalid+)
+        (!set-constituent-trait #\Newline +char-attr-invalid+)
+        (dolist (c (list backspace-char-code tab-char-code form-feed-char-code
+                         return-char-code rubout-char-code))
+          (!set-constituent-trait (code-char c) +char-attr-invalid+)))
+      a))
 
 (declaim (inline get-constituent-trait))
 (defun get-constituent-trait (char)
   (if (typep char 'base-char)
-      (elt *constituent-trait-table* (char-code char))
+      (elt +constituent-trait-table+ (char-code char))
       +char-attr-constituent+))
 
 ;;;; Readtable Operations
@@ -232,19 +227,40 @@
   case)
 
 (defun readtable-normalization (readtable)
-  #!+sb-doc
   "Returns T if READTABLE normalizes strings to NFKC, and NIL otherwise.
 The READTABLE-NORMALIZATION of the standard readtable is T."
   (%readtable-normalization readtable))
 
 (defun (setf readtable-normalization) (new-value readtable)
-  #!+sb-doc
   "Sets the READTABLE-NORMALIZATION of the given READTABLE to NEW-VALUE.
 Pass T to make READTABLE normalize symbols to NFKC (the default behavior),
 and NIL to suppress normalization."
   ;; This function does not accept a readtable designator, only a readtable.
   (assert-not-standard-readtable readtable '(setf readtable-normalization))
   (setf (%readtable-normalization readtable) new-value))
+
+(defun readtable-base-char-preference (readtable)
+  "Returns :SYMBOLS, :STRINGS, :BOTH, or NIL, depending on whether the
+reader should try to intern a base-string when reading a symbol name,
+respectively produce a base-string when reading a quoted string, or in both
+cases, or neither. The preference applies when a symbol-name or string
+contains only BASE-CHAR characters. An (ARRAY CHARACTER (*)) can always
+be interned (returned, respectively) as required. The default is :SYMBOLS."
+  ;; For efficiency the single preference occupies two slots internally.
+  (let ((symbols (eq (%readtable-symbol-preference readtable) 'base-char))
+        (strings (eq (%readtable-string-preference readtable) 'base-char)))
+    (cond ((and strings symbols) :both)
+          (symbols :symbols)
+          (strings :strings))))
+
+(defun (setf readtable-base-char-preference) (new-value readtable)
+  (declare (type (member :symbols :strings :both nil) new-value))
+  "Sets the READTABLE-BASE-CHAR-PREFERENCE of the given READTABLE."
+  (setf (%readtable-symbol-preference readtable)
+        (if (member new-value '(:symbols :both)) 'base-char 'character)
+        (%readtable-string-preference readtable)
+        (if (member new-value '(:strings :both)) 'base-char 'character))
+  new-value)
 
 (defun replace/eql-hash-table (to from &optional (transform #'identity))
   (maphash (lambda (k v) (setf (gethash k to) (funcall transform v))) from)
@@ -274,7 +290,6 @@ and NIL to suppress normalization."
         entry)))
 
 (defun copy-readtable (&optional (from-readtable *readtable*) to-readtable)
-  #!+sb-doc
   "Copies FROM-READTABLE and returns the result. Uses TO-READTABLE as a target
 for the copy when provided, otherwise a new readtable is created. The
 FROM-READTABLE defaults to the standard readtable when NIL and to the current
@@ -296,13 +311,16 @@ readtable when not provided."
      #'copy-cmt-entry)
     (setf (readtable-case really-to-readtable)
           (readtable-case really-from-readtable))
+    (setf (%readtable-string-preference really-to-readtable)
+          (%readtable-string-preference really-from-readtable)
+          (%readtable-symbol-preference really-to-readtable)
+          (%readtable-symbol-preference really-from-readtable))
     (setf (readtable-normalization really-to-readtable)
           (readtable-normalization really-from-readtable))
     really-to-readtable))
 
 (defun set-syntax-from-char (to-char from-char &optional
                              (to-readtable *readtable*) (from-readtable nil))
-  #!+sb-doc
   "Causes the syntax of TO-CHAR to be the same as FROM-CHAR in the optional
 readtable (defaults to the current readtable). The FROM-TABLE defaults to the
 standard Lisp readtable when NIL."
@@ -318,7 +336,6 @@ standard Lisp readtable when NIL."
 (defun set-macro-character (char function &optional
                                  (non-terminatingp nil)
                                  (rt-designator *readtable*))
-  #!+sb-doc
   "Causes CHAR to be a macro character which invokes FUNCTION when seen
    by the reader. The NON-TERMINATINGP flag can be used to make the macro
    character non-terminating, i.e. embeddable in a symbol name."
@@ -332,7 +349,6 @@ standard Lisp readtable when NIL."
     t)) ; (ANSI-specified return value)
 
 (defun get-macro-character (char &optional (rt-designator *readtable*))
-  #!+sb-doc
   "Return the function associated with the specified CHAR which is a macro
   character, or NIL if there is no such function. As a second value, return
   T if CHAR is a macro character which is non-terminating, i.e. which can
@@ -360,7 +376,6 @@ standard Lisp readtable when NIL."
 (defun make-dispatch-macro-character (char &optional
                                       (non-terminating-p nil)
                                       (rt *readtable*))
-  #!+sb-doc
   "Cause CHAR to become a dispatching macro character in readtable (which
    defaults to the current readtable). If NON-TERMINATING-P, the char will
    be non-terminating."
@@ -382,7 +397,6 @@ standard Lisp readtable when NIL."
 
 (defun set-dispatch-macro-character (disp-char sub-char function
                                      &optional (rt-designator *readtable*))
-  #!+sb-doc
   "Cause FUNCTION to be called whenever the reader reads DISP-CHAR
    followed by SUB-CHAR."
   ;; Get the dispatch char for macro (error if not there), diddle
@@ -410,7 +424,6 @@ standard Lisp readtable when NIL."
 
 (defun get-dispatch-macro-character (disp-char sub-char
                                      &optional (rt-designator *readtable*))
-  #!+sb-doc
   "Return the macro character function for SUB-CHAR under DISP-CHAR
    or NIL if there is no associated function."
   (let ((dtable (get-dispatch-macro-char-table
@@ -538,11 +551,8 @@ standard Lisp readtable when NIL."
 (defvar *read-buffer*)
 
 ;; A list of available TOKEN-BUFs
-;; Should need no toplevel binding if multi-threaded,
-;; but doesn't really matter, as INITIAL-THREAD-FUNCTION-TRAMPOLINE
-;; rebinds to NIL.
 (declaim (type (or null token-buf) *token-buf-pool*))
-(defvar *token-buf-pool* nil)
+(!define-thread-local *token-buf-pool* nil)
 
 (defun reset-read-buffer (buffer)
   ;; Turn BUFFER into an empty read buffer.
@@ -605,7 +615,7 @@ standard Lisp readtable when NIL."
   (named-let free ((buffer chain))
     ;; If 'adjustable-string' was displaced to 'string',
     ;; adjust it back down to allow GC of the abnormally large string.
-    (unless (eq (%array-data-vector (token-buf-adjustable-string buffer))
+    (unless (eq (%array-data (token-buf-adjustable-string buffer))
                 (token-buf-initial-string buffer))
       (adjust-array (token-buf-adjustable-string buffer) '(0)
                     :displaced-to (token-buf-initial-string buffer)))
@@ -719,7 +729,6 @@ standard Lisp readtable when NIL."
                                              (eof-error-p t)
                                              (eof-value nil)
                                              (recursive-p nil))
-  #!+sb-doc
   "Read from STREAM and return the value read, preserving any whitespace
    that followed the object."
   (declare (explicit-check))
@@ -731,30 +740,27 @@ standard Lisp readtable when NIL."
 ;;; for functions that want comments to return so that they can look
 ;;; past them. CHAR must not be whitespace.
 (defun read-maybe-nothing (stream char)
-  (truly-the
-   (values bit t) ; avoid a type-check. M-V-CALL is lame
-   (multiple-value-call
-       (lambda (stream start-pos &optional (result nil supplied-p) &rest junk)
-         (declare (ignore junk)) ; is this ANSI-specified?
-         (when (and supplied-p start-pos)
-           (funcall (form-tracking-stream-observer stream)
-                    start-pos
-                    (form-tracking-stream-input-char-pos stream) result))
-         (values (if supplied-p 1 0) result))
-     ;; KLUDGE: not capturing anything in the lambda avoids closure consing
-     stream
-     (and (form-tracking-stream-p stream)
-          ;; Subtract 1 because the position points _after_ CHAR.
-          (1- (form-tracking-stream-input-char-pos stream)))
-     (funcall (!cmt-entry-to-function
-               (get-raw-cmt-entry char *readtable*) #'read-token)
-              stream char))))
+  (multiple-value-call
+      (lambda (stream start-pos &optional (result nil supplied-p) &rest junk)
+        (declare (ignore junk))         ; is this ANSI-specified?
+        (when (and supplied-p start-pos)
+          (funcall (form-tracking-stream-observer stream)
+                   start-pos
+                   (form-tracking-stream-input-char-pos stream) result))
+        (values (if supplied-p 1 0) result))
+    ;; KLUDGE: not capturing anything in the lambda avoids closure consing
+    stream
+    (and (form-tracking-stream-p stream)
+         ;; Subtract 1 because the position points _after_ CHAR.
+         (1- (form-tracking-stream-input-char-pos stream)))
+    (funcall (!cmt-entry-to-function
+              (get-raw-cmt-entry char *readtable*) #'read-token)
+             stream char)))
 
 (defun read (&optional (stream *standard-input*)
                        (eof-error-p t)
                        (eof-value nil)
                        (recursive-p nil))
-  #!+sb-doc
   "Read the next Lisp value from STREAM, and return it."
   (declare (explicit-check))
   (check-for-recursive-read stream recursive-p 'read)
@@ -861,7 +867,6 @@ standard Lisp readtable when NIL."
   (defun read-delimited-list (endchar &optional
                                       (input-stream *standard-input*)
                                       recursive-p)
-  #!+sb-doc
   "Read Lisp values from INPUT-STREAM until the next character after a
    value's representation is ENDCHAR, and return the objects as a list."
     (declare (explicit-check))
@@ -894,21 +899,6 @@ standard Lisp readtable when NIL."
                                   (truly-the fixnum collectp))))
               (simple-reader-error
                stream "More than one object follows . in list.")))))))
-
-;;; Whether it is permissible to read strings as base-string
-;;; if no extended-chars are present. The system itself prefers this, but
-;;; otherwise it is a contentious issue. We don't (by default) use base-strings,
-;;; so that people can dubiously write:
-;;;   (SETF (CHAR (READ-STRING S) 0) #\PILE_OF_POO),
-;;; which is stupid because it makes an assumption about what READ does.
-#!+sb-unicode
-(defvar *read-prefer-base-string* t)
-(eval-when (:compile-toplevel :execute)
-  (sb!xc:defmacro token-elt-type (flag)
-    (declare (ignorable flag))
-    `(if (and ,flag #!+sb-unicode *read-prefer-base-string*)
-         'base-char
-         'character)))
 
 (defun read-string (stream closech)
   ;; This accumulates chars until it sees same char that invoked it.
@@ -961,7 +951,9 @@ standard Lisp readtable when NIL."
           (let* ((sum (loop for buf in chain sum (length buf)))
                  (result
                   (make-array (+ sum ptr)
-                              :element-type (token-elt-type only-base-chars))))
+                              :element-type (if only-base-chars
+                                                (%readtable-string-preference rt)
+                                                'character))))
             (setq ptr sum)
             ;; Now work backwards from the end
             (replace result buf :start1 ptr)
@@ -1101,11 +1093,9 @@ standard Lisp readtable when NIL."
 ;;;; token fetching
 
 (defvar *read-suppress* nil
-  #!+sb-doc
   "Suppress most interpreting in the reader when T.")
 
 (defvar *read-base* 10
-  #!+sb-doc
   "the radix that Lisp reads numbers in")
 (declaim (type (integer 2 36) *read-base*))
 
@@ -1214,7 +1204,6 @@ standard Lisp readtable when NIL."
                       :format-arguments (list package-designator)))))))
 
 (defun read-token (stream firstchar)
-  #!+sb-doc
   "Default readmacro function. Handles numbers, symbols, and SBCL's
 extended <package-name>::<form-in-package> syntax."
   ;; Check explicitly whether FIRSTCHAR has an entry for
@@ -1577,7 +1566,9 @@ extended <package-name>::<form-in-package> syntax."
         (return (%intern (token-buf-string buf)
                          (token-buf-fill-ptr buf)
                          pkg
-                         (token-elt-type (token-buf-only-base-chars buf)))))))))
+                         (if (token-buf-only-base-chars buf)
+                             (%readtable-symbol-preference rt)
+                             'character))))))))
 
 ;;; For semi-external use: Return 3 values: the token-buf,
 ;;; a flag for whether there was an escape char, and the position of
@@ -1639,7 +1630,6 @@ extended <package-name>::<form-in-package> syntax."
          (t   0)))))
 
 (defun make-integer (&optional (base *read-base*))
-  #!+sb-doc
   "Minimizes bignum-fixnum multiplies by reading a 'safe' number of digits,
   then multiplying by a power of the base and adding."
   (declare ((integer 2 36) base)
@@ -1679,7 +1669,6 @@ extended <package-name>::<form-in-package> syntax."
        (setq result (+ (* result base-power) acc))))))
 
 (defun truncate-exponent (exponent number divisor)
-  #!+sb-doc
   "Truncate exponent if it's too large for a float"
   ;; Work with base-2 logarithms to avoid conversions to floats,
   ;; and convert to base-10 conservatively at the end.
@@ -1754,7 +1743,7 @@ extended <package-name>::<form-in-package> syntax."
 (defun make-float-aux (number divisor float-format stream)
   (handler-case
       (coerce (/ number divisor) float-format)
-    (type-error (c)
+    (arithmetic-error (c)
       (error 'reader-impossible-number-error
              :error c :stream stream
              :format-control "failed to build float from ~a"
@@ -1836,7 +1825,6 @@ extended <package-name>::<form-in-package> syntax."
 (declare (muffle-conditions style-warning))
 (defun read-from-string (string &optional (eof-error-p t) eof-value
                                 &key (start 0) end preserve-whitespace)
-  #!+sb-doc
   "The characters of string are successively given to the lisp reader
    and the lisp object built by the reader is returned. Macro chars
    will take effect."
@@ -1847,7 +1835,6 @@ extended <package-name>::<form-in-package> syntax."
 ;;;; PARSE-INTEGER
 
 (defun parse-integer (string &key (start 0) end (radix 10) junk-allowed)
-  #!+sb-doc
   "Examine the substring of string delimited by start and end
   (default to the beginning and end of the string)  It skips over
   whitespace characters and then tries to parse an integer. The
@@ -1907,7 +1894,6 @@ extended <package-name>::<form-in-package> syntax."
 ;;;; reader initialization code
 
 (defun !reader-cold-init ()
-  (!cold-init-constituent-trait-table)
   (!cold-init-standard-readtable))
 
 (defmethod print-object ((readtable readtable) stream)

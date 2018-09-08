@@ -54,10 +54,13 @@
          (eval-when (:compile-toplevel :load-toplevel :execute)
            (create-alien-type-class-if-necessary ',name ',defstruct-name
                                                  ',(or include 'root)))
+         (setf (info :source-location :alien-type ',name)
+               (sb!c:source-location))
          (def!struct (,defstruct-name
                         (:include ,include-defstruct
                                   (class ',name)
                                   ,@overrides)
+                        (:copier nil)
                         (:constructor
                          ,(symbolicate "MAKE-" defstruct-name)
                          (&key class bits alignment
@@ -150,7 +153,6 @@
         (error "attempt to shadow definition of ~A ~S" kind name)))))
 
 (defun unparse-alien-type (type)
-  #!+sb-doc
   "Convert the alien-type structure TYPE back into a list specification of
    the type."
   (declare (type alien-type type))
@@ -192,7 +194,7 @@
         (setf (info :alien-type kind name) defn
               (info :source-location :alien-type name) source-location))))
 
-  (defun %define-alien-type (name new)
+  (defun %define-alien-type (name new source-location)
     (ecase (info :alien-type :kind name)
       (:primitive
        (error "~/sb!impl:print-type-specifier/ is a built-in alien type."
@@ -209,6 +211,7 @@
       (:unknown))
     (setf (info :alien-type :definition name) new)
     (setf (info :alien-type :kind name) :defined)
+    (setf (info :source-location :alien-type name) source-location)
     name))
 
 ;;;; the root alien type
@@ -273,11 +276,10 @@
 ;;;
 (defmethod print-object ((info heap-alien-info) stream)
   (print-unreadable-object (info stream :type t)
-    (funcall (formatter "~S ~S~@[ (data)~]")
-             stream
-             (heap-alien-info-alien-name info)
-             (unparse-alien-type (heap-alien-info-type info))
-             (heap-alien-info-datap info))))
+    (format stream "~S ~S~@[ (data)~]"
+            (heap-alien-info-alien-name info)
+            (unparse-alien-type (heap-alien-info-type info))
+            (heap-alien-info-datap info))))
 
 ;;; The form to evaluate to produce the SAP pointing to where in the heap
 ;;; it is.
@@ -293,7 +295,6 @@
 ;;;; Interfaces to the different methods
 
 (defun alien-type-= (type1 type2)
-  #!+sb-doc
   "Return T iff TYPE1 and TYPE2 describe equivalent alien types."
   (or (eq type1 type2)
       (and (eq (alien-type-class type1)
@@ -301,7 +302,6 @@
            (invoke-alien-type-method :type= type1 type2))))
 
 (defun alien-subtype-p (type1 type2)
-  #!+sb-doc
   "Return T iff the alien type TYPE1 is a subtype of TYPE2. Currently, the
    only supported subtype relationships are is that any pointer type is a
    subtype of (* t), and any array type first dimension will match
@@ -830,7 +830,7 @@
 
 ;;;; the RECORD type
 
-(def!struct (alien-record-field)
+(def!struct (alien-record-field (:copier nil))
   (name (missing-arg) :type symbol)
   (type (missing-arg) :type alien-type)
   (bits nil :type (or unsigned-byte null))
@@ -968,7 +968,6 @@
                      (alien-record-field-type field2))))
 
 (defvar *alien-type-matches* nil
-  #!+sb-doc
   "A hashtable used to detect cycles while comparing record types.")
 
 (define-alien-type-method (record :type=) (type1 type2)
@@ -1016,8 +1015,17 @@
 (define-alien-type-class (fun :include mem-block)
   (result-type (missing-arg) :type alien-type)
   (arg-types (missing-arg) :type list)
+  ;; The 3rd-party CFFI library uses presence of &REST in an argument list
+  ;; as indicative of "..." in the C prototype. We can record that too.
+  (varargs nil :type (or boolean (eql :unspecified)))
   (stub nil :type (or null function))
   (convention nil :type calling-convention))
+;;; The safe default is to assume that everything is varargs.
+;;; On x86-64 we have to emit a spurious instruction because of it.
+;;; So until all users fix their lambda lists to be explicit about &REST
+;;; (which is never gonna happen), be backward-compatible, unless
+;;; locally toggled to get rid of noise instructions if so inclined.
+(defglobal *alien-fun-type-varargs-default* :unspecified)
 
 ;;; KLUDGE: non-intrusive, backward-compatible way to allow calling
 ;;; convention specification for function types is unobvious.
@@ -1029,17 +1037,19 @@
 
 (define-alien-type-translator function (result-type &rest arg-types
                                                     &environment env)
-  (multiple-value-bind (bare-result-type calling-convention)
-      (typecase result-type
-        ((cons calling-convention *)
-           (values (second result-type) (first result-type)))
-        (t result-type))
+  (binding* (((bare-result-type calling-convention)
+              (typecase result-type
+                ((cons calling-convention *)
+                 (values (second result-type) (first result-type)))
+                (t result-type)))
+             (varargs (eq (car (last arg-types)) '&rest)))
     (make-alien-fun-type
      :convention calling-convention
      :result-type (let ((*values-type-okay* t))
                     (parse-alien-type bare-result-type env))
+     :varargs (or varargs *alien-fun-type-varargs-default*)
      :arg-types (mapcar (lambda (arg-type) (parse-alien-type arg-type env))
-                        arg-types))))
+                        (if varargs (butlast arg-types) arg-types)))))
 
 (define-alien-type-method (fun :unparse) (type)
   `(function ,(let ((result-type
@@ -1048,7 +1058,9 @@
                 (if convention (list convention result-type)
                     result-type))
              ,@(mapcar #'%unparse-alien-type
-                       (alien-fun-type-arg-types type))))
+                       (alien-fun-type-arg-types type))
+             ,@(when (alien-fun-type-varargs type)
+                 '(&rest))))
 
 (define-alien-type-method (fun :type=) (type1 type2)
   (and (alien-type-= (alien-fun-type-result-type type1)
@@ -1090,6 +1102,7 @@
 ;;; these structures and LOCAL-ALIEN and friends communicate
 ;;; information about how that local alien is represented.
 (def!struct (local-alien-info
+             (:copier nil)
              (:constructor make-local-alien-info
                            (&key type force-to-memory-p
                             &aux (force-to-memory-p (or force-to-memory-p
@@ -1111,7 +1124,6 @@
 ;;;; the ADDR macro
 
 (sb!xc:defmacro addr (expr &environment env)
-  #!+sb-doc
   "Return an Alien pointer to the data addressed by Expr, which must be a call
    to SLOT or DEREF, or a reference to an Alien variable."
   (let ((form (%macroexpand expr env)))
@@ -1139,5 +1151,32 @@
              (when (eq kind :alien)
                `(%heap-alien-addr ',(info :variable :alien-info form))))))
         (error "~S is not a valid L-value." form))))
+
+(push '("SB-ALIEN" define-alien-type-class define-alien-type-method)
+      sb!impl::*!removable-symbols*)
+
+(in-package "SB!IMPL")
+
+(defun extern-alien-name (name)
+ (handler-case (coerce name 'base-string)
+   (error ()
+     (error "invalid external alien name: ~S" name))))
+
+(declaim (ftype (sfunction (string hash-table) (or integer null))
+                find-foreign-symbol-in-table))
+(defun find-foreign-symbol-in-table (name table)
+  (let ((extern (extern-alien-name name)))
+    (values
+     (or (gethash extern table)
+         (gethash (concatenate 'base-string "ldso_stub__" extern) table)))))
+
+;;; *STATIC-FOREIGN-SYMBOLS* are static as opposed to "dynamic" (not
+;;; as opposed to C's "extern"). The table contains symbols known at
+;;; the time that the program was built, but not symbols defined in
+;;; object files which have been loaded dynamically since then.
+#!-sb-dynamic-core
+(progn
+  (declaim (type hash-table *static-foreign-symbols*))
+  (defvar *static-foreign-symbols* (make-hash-table :test 'equal)))
 
 (/show0 "host-alieneval.lisp end of file")

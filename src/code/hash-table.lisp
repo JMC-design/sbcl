@@ -22,11 +22,10 @@
                                 rehash-threshold
                                 rehash-trigger
                                 table
-                                weakness
                                 index-vector
                                 next-vector
                                 hash-vector
-                                synchronized-p)))
+                                flags)))
   ;; The type of hash table this is. Only used for printing and as
   ;; part of the exported interface.
   (test nil :type symbol :read-only t)
@@ -55,10 +54,9 @@
   ;; This slot is used to link weak hash tables during GC. When the GC
   ;; isn't running it is always NIL.
   (next-weak-hash-table nil :type null)
-  ;; Non-NIL if this is some kind of weak hash table. For details see
-  ;; the docstring of MAKE-HASH-TABLE.
-  (weakness nil :type (member nil :key :value :key-or-value :key-and-value)
-            :read-only t)
+  ;; flags: WEAKNESS-KIND | FINALIZERSP | SYNCHRONIZEDP | WEAKP
+  ;; WEAKNESS-KIND is 2 bits, the rest are 1 bit each
+  (flags 0 :type (unsigned-byte 5) :read-only t)
   ;; Index into the Next vector chaining together free slots in the KV
   ;; vector.
   (next-free-kv 0 :type index)
@@ -82,13 +80,8 @@
   ;; Used for locking GETHASH/(SETF GETHASH)/REMHASH
   (lock (sb!thread:make-mutex :name "hash-table lock")
         :type sb!thread:mutex :read-only t)
-  ;; The GC will set this to T if it moves an EQ-based key. This used
-  ;; to be signaled by a bit in the header of the kv vector, but that
-  ;; implementation caused some concurrency issues when we stopped
-  ;; inhibiting GC during hash-table lookup.
-  (needs-rehash-p nil :type (member nil t))
-  ;; Has user requested synchronization?
-  (synchronized-p nil :type (member nil t) :read-only t)
+  ;; List of values culled out during GC of weak hash table.
+  (culled-values nil :type list)
   ;; For detecting concurrent accesses.
   #!+sb-hash-table-debug
   (signal-concurrent-access t :type (member nil t))
@@ -104,25 +97,6 @@
 ;; now depends on the word size. It is propagated to C in genesis because
 ;; the generational garbage collector needs to know it.
 (defconstant +magic-hash-vector-value+ (ash 1 (1- sb!vm:n-word-bits)))
-
-(sb!xc:defmacro with-locked-hash-table ((hash-table) &body body)
-  #!+sb-doc
-  "Limits concurrent accesses to HASH-TABLE for the duration of BODY.
-If HASH-TABLE is synchronized, BODY will execute with exclusive
-ownership of the table. If HASH-TABLE is not synchronized, BODY will
-execute with other WITH-LOCKED-HASH-TABLE bodies excluded -- exclusion
-of hash-table accesses not surrounded by WITH-LOCKED-HASH-TABLE is
-unspecified."
-  ;; Needless to say, this also excludes some internal bits, but
-  ;; getting there is too much detail when "unspecified" says what
-  ;; is important -- unpredictable, but harmless.
-  `(sb!thread::with-recursive-lock ((hash-table-lock ,hash-table))
-     ,@body))
-
-(sb!xc:defmacro with-locked-system-table ((hash-table) &body body)
-  `(sb!thread::with-recursive-system-lock
-       ((hash-table-lock ,hash-table))
-     ,@body))
 
 ;;; Return an association list representing the same data as HASH-TABLE.
 (defun %hash-table-alist (hash-table)

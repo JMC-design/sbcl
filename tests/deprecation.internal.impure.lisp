@@ -9,12 +9,9 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(use-package '#:assertoid)
-
 ;;;; Helpers
 
-(defun check-deprecated-thing (kind name state make-body
+(defun test (kind name state make-body
                                &key (replacements
                                      (list (format nil "~A.~A"
                                                    name '#:replacement))))
@@ -47,7 +44,8 @@
         ((:early :late)
          (assert (eq :deprecated (funcall function))))
         (:final
-         (assert-error (funcall function) deprecation-error))))
+         (assert-error (funcall function)
+                       (or deprecation-error cell-error)))))
     ;; Check the documentation.
     #+sb-doc
     (search-string (documentation name kind))))
@@ -60,11 +58,11 @@
   :replacement deprecated-variable.early.replacement)
 
 (with-test (:name (sb-int:define-deprecated-variable :early))
-  (check-deprecated-thing 'variable 'deprecated-variable.early :early
+  (test 'variable 'deprecated-variable.early :early
                           (lambda (name) `(,name)))
-  (check-deprecated-thing 'variable 'deprecated-variable.early :early
+  (test 'variable 'deprecated-variable.early :early
                           (lambda (name) `((symbol-value ',name))))
-  (check-deprecated-thing 'variable 'deprecated-variable.early :early
+  (test 'variable 'deprecated-variable.early :early
                           (lambda (name) `((symbol-global-value ',name)))))
 
 (sb-int:define-deprecated-variable :late "1.2.10"
@@ -73,11 +71,11 @@
   :replacement deprecated-variable.late.replacement)
 
 (with-test (:name (sb-int:define-deprecated-variable :late))
-  (check-deprecated-thing 'variable 'deprecated-variable.late :late
+  (test 'variable 'deprecated-variable.late :late
                           (lambda (name) `(,name)))
-  (check-deprecated-thing 'variable 'deprecated-variable.late :late
+  (test 'variable 'deprecated-variable.late :late
                           (lambda (name) `((symbol-value ',name))))
-  (check-deprecated-thing 'variable 'deprecated-variable.late :late
+  (test 'variable 'deprecated-variable.late :late
                           (lambda (name) `((symbol-global-value ',name)))))
 
 (sb-int:define-deprecated-variable :final "1.2.10"
@@ -86,11 +84,11 @@
   :replacement deprecated-variable.final.replacement)
 
 (with-test (:name (sb-int:define-deprecated-variable :final))
-  (check-deprecated-thing 'variable 'deprecated-variable.final :final
+  (test 'variable 'deprecated-variable.final :final
                           (lambda (name) `(,name)))
-  (check-deprecated-thing 'variable 'deprecated-variable.final :final
+  (test 'variable 'deprecated-variable.final :final
                           (lambda (name) `((symbol-value ',name))))
-  (check-deprecated-thing 'variable 'deprecated-variable.final :final
+  (test 'variable 'deprecated-variable.final :final
                           (lambda (name) `((symbol-global-value ',name)))))
 
 
@@ -101,7 +99,7 @@
   :deprecated)
 
 (with-test (:name (sb-int:define-deprecated-function :early))
-  (check-deprecated-thing 'function 'deprecated-function.early :early
+  (test 'function 'deprecated-function.early :early
                           (lambda (name) `((,name)))))
 
 (sb-int:define-deprecated-function :late "1.2.10"
@@ -109,7 +107,7 @@
   :deprecated)
 
 (with-test (:name (sb-int:define-deprecated-function :late))
-  (check-deprecated-thing 'function 'deprecated-function.late :late
+  (test 'function 'deprecated-function.late :late
                           (lambda (name) `((,name)))))
 
 (sb-int:define-deprecated-function :final "1.2.10"
@@ -117,7 +115,7 @@
   :deprecated)
 
 (with-test (:name (sb-int:define-deprecated-function :final))
-  (check-deprecated-thing 'function 'deprecated-function.final :final
+  (test 'function 'deprecated-function.final :final
                           (lambda (name) `((,name)))))
 
 (sb-int:define-deprecated-function :early "1.2.10"
@@ -128,7 +126,7 @@
   :deprecated)
 
 (with-test (:name (sb-int:define-deprecated-function :two-replacements))
-  (check-deprecated-thing
+  (test
    'function 'deprecated-function.two-replacements :early
    (lambda (name) `((,name)))
    :replacements '("DEPRECATED-FUNCTION.TWO-REPLACEMENTS.REPLACEMENT1"
@@ -143,7 +141,7 @@
   :deprecated)
 
 (with-test (:name (sb-int:define-deprecated-function :three-replacements))
-  (check-deprecated-thing
+  (test
    'function 'deprecated-function.three-replacements :early
    (lambda (name) `((,name)))
    :replacements '("DEPRECATED-FUNCTION.THREE-REPLACEMENTS.REPLACEMENT1"

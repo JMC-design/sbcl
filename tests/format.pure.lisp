@@ -54,3 +54,39 @@
   (with-compiled-and-interpreted-format ()
     (assert-error (format* "~2@*" '()) format-error-with-control-string)
     (assert-error (format* "~1:*" '()) format-error-with-control-string)))
+
+(with-test (:name :encapsulated-~/-formatter)
+  (let ((s (make-string-output-stream)))
+    (declare (notinline format))
+    (sb-int:encapsulate 'sb-ext:print-symbol-with-prefix 'test
+                        (lambda (f stream obj &rest args)
+                          (write-string "{{" stream)
+                          (apply f stream obj args)
+                          (write-string "}}" stream)))
+    (format s "~/sb-ext:print-symbol-with-prefix/" 'cl-user::test)
+    (sb-int:unencapsulate 'sb-ext:print-symbol-with-prefix 'test)
+    (assert (string= "{{COMMON-LISP-USER::TEST}}" (get-output-stream-string s)))))
+
+(with-test (:name :non-simple-string)
+  (let ((control (make-array 2 :element-type 'base-char
+                               :initial-element #\A
+                               :fill-pointer 1)))
+    (checked-compile-and-assert
+        ()
+        `(lambda () (with-output-to-string (stream)
+                      (funcall (formatter ,control) stream)))
+      (() "A" :test #'equal))
+    (checked-compile-and-assert
+        ()
+        `(lambda () (format nil ,control))
+      (() "A" :test #'equal))
+    (checked-compile-and-assert
+        ()
+        `(lambda () (cerror ,control ,control))
+      (() (condition 'simple-error)))
+    (checked-compile-and-assert
+        ()
+        `(lambda () (error ,control))
+      (() (condition 'simple-error)))))
+
+

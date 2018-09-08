@@ -68,12 +68,10 @@
   '(character-set ((0 . #.(1- base-char-code-limit)))))
 
 (sb!xc:deftype extended-char ()
-  #!+sb-doc
   "Type of CHARACTERs that aren't BASE-CHARs."
   '(and character (not base-char)))
 
 (sb!xc:deftype standard-char ()
-  #!+sb-doc
   "Type corresponding to the characters required by the standard."
   '(member
     #\Newline #\Space #\! #\" #\# #\$ #\% #\& #\' #\( #\) #\* #\+ #\,
@@ -125,6 +123,10 @@
   '(and function
         #!+sb-fasteval (not sb!interpreter:interpreted-function)
         #!+sb-eval (not sb!eval:interpreted-function)))
+
+(sb!xc:deftype simple-fun () '(satisfies simple-fun-p))
+
+(sb!xc:deftype closure () '(satisfies closurep))
 
 ;;;; some private types that we use in defining the standard functions,
 ;;;; or implementing declarations in standard compiler transforms
@@ -134,6 +136,9 @@
 
 (sb!xc:deftype format-control ()
   '(or string function))
+
+(sb!xc:deftype condition-designator-head ()
+  '(or format-control symbol condition sb!pcl::condition-class))
 
 (sb!xc:deftype restart-designator ()
   '(or (and symbol (not null)) restart))
@@ -164,9 +169,11 @@
 
 ;;; legal args to pathname functions
 (sb!xc:deftype pathname-designator ()
-  '(or string pathname #+sb-xc-host stream #-sb-xc-host file-stream))
+  '(or string pathname #+sb-xc-host stream #-sb-xc-host synonym-stream #-sb-xc-host file-stream))
 (sb!xc:deftype logical-host-designator ()
   '(or host string))
+(sb!xc:deftype pathname-component-case ()
+  '(member :local :common))
 
 (sb!xc:deftype package-designator () '(or string-designator package))
 ;;; a designator for a list of symbols

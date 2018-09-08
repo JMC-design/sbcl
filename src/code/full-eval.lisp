@@ -107,7 +107,7 @@
                             (sb!c::lexenv-funs old-lexenv))
                    (nconc-2 (mapcar #'to-native-vars new-vars)
                             (sb!c::lexenv-vars old-lexenv))
-                   nil nil nil nil nil
+                   nil nil nil nil nil nil
                    (sb!c::lexenv-handled-conditions old-lexenv)
                    (sb!c::lexenv-disabled-package-locks old-lexenv)
                    (sb!c::lexenv-policy old-lexenv) ; = (OR %POLICY *POLICY*)
@@ -183,7 +183,7 @@
 (defun make-null-environment ()
   (%make-env nil nil nil nil nil nil nil nil
              (sb!c::internal-make-lexenv
-              nil nil
+              nil nil nil
               nil nil nil nil nil nil nil
               sb!c::*policy*
               nil nil)))
@@ -917,8 +917,12 @@
 
 (defun eval-the (body env)
   (program-destructuring-bind (value-type form) body
-    (let ((values (multiple-value-list (%eval form env)))
-          (vtype (if (ctype-p value-type) value-type (values-specifier-type value-type))))
+    (let* ((values (multiple-value-list (%eval form env)))
+           (vtype (if (ctype-p value-type) value-type (values-specifier-type value-type)))
+           (vtype (typecase vtype
+                    (fun-designator-type (specifier-type '(or function symbol)))
+                    (fun-type (specifier-type 'function))
+                    (t vtype))))
       ;; FIXME: we should probably do this only if SAFETY>SPEED
       (cond
         ((eq vtype *wild-type*) (values-list values))
@@ -986,7 +990,7 @@
   (program-destructuring-bind (values &body body) args
     (if (null values)
         (eval-progn body env)
-        (sb!sys:with-pinned-objects ((car values))
+        (sb!sys:with-pinned-objects ((%eval (car values) env))
           (eval-with-pinned-objects (cons (cdr values) body) env)))))
 
 (defvar *eval-dispatch-functions* nil)

@@ -86,37 +86,50 @@
             numarg
             (copy-token-buf-string buffer))))))
 
-(defun sharp-A (stream ignore dimensions)
+(defun sharp-A (stream ignore rank)
   (declare (ignore ignore))
   (when *read-suppress*
     (read stream t nil t)
     (return-from sharp-A nil))
-  (unless dimensions
-    (simple-reader-error stream "No dimensions argument to #A."))
-  (collect ((dims))
-    (let* ((*bq-error*
-            (if (zerop *backquote-depth*)
-                *bq-error*
-                "Comma inside a backquoted array (not a list or general vector.)"))
-           (*backquote-depth* 0)
-           (contents (read stream t nil t))
-           (seq contents))
-      (dotimes (axis dimensions
-                     (make-array (dims) :initial-contents contents))
-        (unless (typep seq 'sequence)
-          (simple-reader-error stream
-                               "#~WA axis ~W is not a sequence:~%  ~S"
-                               dimensions axis seq))
-        (let ((len (length seq)))
-          (dims len)
-          (unless (or (= axis (1- dimensions))
-                      ;; ANSI: "If some dimension of the array whose
-                      ;; representation is being parsed is found to be
-                      ;; 0, all dimensions to the right (i.e., the
-                      ;; higher numbered dimensions) are also
-                      ;; considered to be 0."
-                      (= len 0))
-            (setq seq (elt seq 0))))))))
+  (let* ((*bq-error*
+           (if (zerop *backquote-depth*)
+               *bq-error*
+               "Comma inside a backquoted array (not a list or general vector.)"))
+         (*backquote-depth* 0)
+         (contents (read stream t nil t)))
+    (cond
+      (rank
+       (collect ((dims))
+         (let ((seq contents))
+           (dotimes (axis rank
+                          (make-array (dims) :initial-contents contents))
+             (unless (typep seq 'sequence)
+               (simple-reader-error stream
+                                    "#~WA axis ~W is not a sequence:~%  ~S"
+                                    rank axis seq))
+             (let ((len (length seq)))
+               (dims len)
+               (unless (or (= axis (1- rank))
+                           ;; ANSI: "If some dimension of the array whose
+                           ;; representation is being parsed is found to be
+                           ;; 0, all dimensions to the right (i.e., the
+                           ;; higher numbered dimensions) are also
+                           ;; considered to be 0."
+                           (= len 0))
+                 (setq seq (elt seq 0))))))))
+      ;; It's not legal to have #A without the rank, use that for
+      ;; #A(dimensions element-type contents) to avoid using #. when
+      ;; printing specialized arrays readably.
+      ((list-of-length-at-least-p contents 2)
+       (destructuring-bind (dimensions type &rest contents) contents
+         (make-array dimensions :initial-contents contents
+                                :element-type type)))
+      (t
+       (simple-reader-error stream
+                            "~@<Array literal is neither of the ~
+                             standard form #<rank>A<contents> nor the ~
+                             SBCL-specific form #A(dimensions ~
+                             element-type . contents).~@:>")))))
 
 ;;;; reading structure instances: the #S readmacro
 
@@ -340,6 +353,27 @@
 
 ;;;; conditional compilation: the #+ and #- readmacros
 
+;;; If X is a symbol, see whether it is present in *FEATURES*. Also
+;;; handle arbitrary combinations of atoms using NOT, AND, OR.
+(defun featurep (x)
+  (typecase x
+    (cons
+     (case (car x)
+       ((:not not)
+        (cond
+          ((cddr x)
+           (error "too many subexpressions in feature expression: ~S" x))
+          ((null (cdr x))
+           (error "too few subexpressions in feature expression: ~S" x))
+          (t (not (featurep (cadr x))))))
+       ((:and and) (every #'featurep (cdr x)))
+       ((:or or) (some #'featurep (cdr x)))
+       (t
+        (error "unknown operator in feature expression: ~S." x))))
+    (symbol (not (null (memq x *features*))))
+    (t
+      (error "invalid feature expression: ~S" x))))
+
 (defun sharp-plus-minus (stream sub-char numarg)
     (ignore-numarg sub-char numarg)
     (if (char= (if (featurep (let ((*package* *keyword-package*)
@@ -451,7 +485,6 @@
                (make-symbol token)))))))
 
 (defvar *read-eval* t
-  #!+sb-doc
   "If false, then the #. read macro is disabled.")
 
 (defun sharp-dot (stream sub-char numarg)

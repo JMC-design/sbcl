@@ -242,11 +242,11 @@
                              collect
                              `(list ,@(loop for j below n-cells
                                             collect `(access ,depth ,j))))))))
-  (defparameter *fast-lexvar-reffers*
+  (define-load-time-global *fast-lexvar-reffers*
     (macrolet ((access (up across)
                  `(hlambda GET-VAR () (env) (ref ,up ,across))))
       (array-of 4 10))) ; for 4 scopes and 10 names per scope you can go fast
-  (defparameter *fast-lexvar-setters* ; These are lambdas, not handlers
+  (define-load-time-global *fast-lexvar-setters* ; These are lambdas, not handlers
     (macrolet ((access (up across)
                  `(named-lambda (eval SET-VAR) (form env sexpr)
                     (declare #.+handler-optimize+ (ignore sexpr))
@@ -496,18 +496,20 @@
 (defun err-too-few-args (fun n-args)
   (declare (explicit-check))
   (let ((frame (interpreted-function-frame fun)))
-    (ip-error "~S received ~D argument~:P but expects~:[ at least~;~] ~D."
-           (name-for-fun fun) n-args
-           (eql (lambda-frame-min-args frame) (lambda-frame-max-args frame))
-           (lambda-frame-min-args frame))))
+    (%program-error "~S received ~D argument~:P but expects~:[ at least~;~] ~D."
+                    (name-for-fun fun) n-args
+                    (eql (lambda-frame-min-args frame)
+                         (lambda-frame-max-args frame))
+                    (lambda-frame-min-args frame))))
 
 (defun err-too-many-args (fun n-args)
   (declare (explicit-check))
   (let ((frame (interpreted-function-frame fun)))
-    (ip-error "~S received ~D argument~:P but expects~:[ at most~;~] ~D"
-           (name-for-fun fun) n-args
-           (eql (lambda-frame-min-args frame) (lambda-frame-max-args frame))
-           (lambda-frame-max-args frame))))
+    (%program-error "~S received ~D argument~:P but expects~:[ at most~;~] ~D"
+                    (name-for-fun fun) n-args
+                    (eql (lambda-frame-min-args frame)
+                         (lambda-frame-max-args frame))
+                    (lambda-frame-max-args frame))))
 
 (defmacro with-lambda-frame ((frame-var fun if-invalid) &body if-valid)
   ;; If any global variable has changed its :KIND, this function's lambda
@@ -530,7 +532,7 @@
                (if (oddp n-more)
                    (fail-odd-length (+ n-seen n-more)))))
            (fail-odd-length (n)
-             (ip-error "odd number of &KEY arguments: ~D" n))
+             (%program-error "odd number of &KEY arguments: ~D" n))
            (fail-other-key ()
              (let ((n-allowed (keyword-bits-n-keys control-bits)) bad)
                (loop for (key val) on list by #'cddr ; rescan to collect them
@@ -538,10 +540,11 @@
                                 (find key allowed :end n-allowed))
                      do (pushnew key bad))
                (let ((plural (cdr bad)))
-                 (ip-error "Keyword~*~:[~;s~]~2:* ~{~S~^,~} ~:[is~;are~] not ~
-                            ~:[allowed.~;in the allowed set ~:*~S~]"
-                           (nreverse bad) plural
-                           (replace (make-list n-allowed) allowed))))))
+                 (%program-error "Keyword~*~:[~;s~]~2:* ~{~S~^,~} ~
+                                  ~:[is~;are~] not ~:[allowed.~;in the ~
+                                  allowed set ~:*~S~]"
+                                 (nreverse bad) plural
+                                 (replace (make-list n-allowed) allowed))))))
     (if (keyword-bits-allowp control-bits)
         (check-odd-length list 0)
         (let ((n-allowed (keyword-bits-n-keys control-bits))
@@ -706,7 +709,7 @@
                     (frame fun (interpreter-trampoline fun ,@args))
                   (dispatch (lambda-frame-sexpr frame)
                             (new-env make-var-env
-                                     ,(if (zerop n) nil `(vector ,@args))))))
+                                     ,(if (zerop n) #() `(vector ,@args))))))
               (named-lambda (.apply. ,n) ,args
                 (declare #.+handler-optimize+ (optimize sb-c:verify-arg-count))
                 (with-lambda-frame
@@ -715,7 +718,7 @@
                     (catch exit
                       (dispatch (lambda-frame-sexpr frame)
                                 (new-env make-lambda-env
-                                         ,(if (zerop n) nil `(vector ,@args))
+                                         ,(if (zerop n) #() `(vector ,@args))
                                          exit)))))))))
     (case (lambda-frame-min-args (interpreted-function-frame fun))
       (5 (invoke 5))
@@ -950,7 +953,7 @@ Test case.
 
 (defun arglist-to-sexprs (args)
   (let ((argc (or (list-length args)
-                  (ip-error "Malformed function call"))))
+                  (%program-error "Malformed function call"))))
     (values (mapcar #'%sexpr args) argc)))
 
 ;;; Return a handler which decides whether its supplied SEXPR needs
@@ -1202,7 +1205,9 @@ Test case.
                (digest-local-call frame-ptr (cdr args))))))))
 
   (let ((n-args 0)
-        (fun (fdefinition fname)))
+        (fun (if (typep fname '(cons (eql sb-pcl::slot-accessor)))
+                 (funcall 'sb-pcl::ensure-accessor fname)
+                 (fdefinition fname))))
     (multiple-value-setq (args n-args) (arglist-to-sexprs args))
 
     ;; Fold if every arg when trivially constant and the function is foldable.

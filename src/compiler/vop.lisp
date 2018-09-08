@@ -16,21 +16,84 @@
 ;;; in any block
 (defconstant local-tn-limit 64)
 
-(deftype local-tn-number () `(integer 0 (,local-tn-limit)))
+(def!type local-tn-number () `(integer 0 (,local-tn-limit)))
 (deftype local-tn-count () `(integer 0 ,local-tn-limit))
 (deftype local-tn-vector () `(simple-vector ,local-tn-limit))
-(deftype local-tn-bit-vector () `(simple-bit-vector ,local-tn-limit))
+(def!type local-tn-bit-vector () `(simple-bit-vector ,local-tn-limit))
 
-;;; type of an SC number
-(deftype sc-number () `(integer 0 (,sc-number-limit)))
+;;; vectors indexed by SC numbers
+(def!type sc-vector () `(simple-vector ,sb!vm:sc-number-limit))
+(deftype sc-bit-vector () `(simple-bit-vector ,sb!vm:sc-number-limit))
 
-;;; types for vectors indexed by SC numbers
-(deftype sc-vector () `(simple-vector ,sc-number-limit))
-(deftype sc-bit-vector () `(simple-bit-vector ,sc-number-limit))
+;;; Bitset representation of a set of locations in a finite SC.
+(def!type sc-locations ()
+  `(unsigned-byte ,sb!vm:finite-sc-offset-limit))
+
+(defun make-sc-locations (locations)
+  (reduce (lambda (value location)
+            (check-type location sb!vm:finite-sc-offset)
+            (dpb 1 (byte 1 location) value))
+          locations :initial-value 0))
+
+(declaim (inline sc-offset-to-sc-locations)
+         (ftype (sfunction (sb!vm:finite-sc-offset) sc-locations)
+                sc-offset-to-sc-locations))
+(defun sc-offset-to-sc-locations (offset)
+  (dpb 1 (byte 1 offset) 0))
+
+(declaim (inline sc-locations-count)
+         (ftype (sfunction (sc-locations) (integer 0 #.sb!vm:finite-sc-offset-limit))
+                sc-locations-count))
+(defun sc-locations-count (locations)
+  (logcount locations))
+
+(declaim (inline sc-locations-first)
+         (ftype (sfunction (sc-locations) sb!vm:finite-sc-offset)
+                sc-locations-first))
+(defun sc-locations-first (locations)
+  (1- (integer-length (logxor locations (1- locations)))))
+
+(declaim (inline sc-locations-member)
+         (ftype (sfunction (sb!vm:finite-sc-offset sc-locations) boolean)
+                sc-locations-member))
+(defun sc-locations-member (location locations)
+  (logbitp location locations))
+
+(defmacro do-sc-locations ((location locations
+                            &optional result increment (limit nil limitp))
+                           &body body)
+  (let* ((limit (cond
+                  ((not limitp)
+                   sb!vm:finite-sc-offset-limit)
+                  ((not (constantp limit))
+                   limit)
+                  ((eval limit))
+                  (t
+                   sb!vm:finite-sc-offset-limit)))
+         (mid   (floor sb!vm:finite-sc-offset-limit 2)))
+    (once-only ((locations locations)
+                (increment `(the sb!vm:finite-sc-offset ,(or increment 1))))
+      (labels ((make-block (start end)
+                 `(loop named #:noname
+                        for ,location
+                        from ,start below ,end by ,increment
+                        when (logbitp ,location ,locations)
+                        do (locally (declare (sb!vm:finite-sc-offset
+                                              ,location))
+                             ,@body)))
+               (make-guarded-block (start end)
+                 (unless (and (numberp limit) (<= limit start))
+                   (let ((mask (dpb -1 (byte mid start) 0)))
+                     `((when (logtest ,mask ,locations)
+                         ,(make-block start end )))))))
+        `(block nil
+           ,@(make-guarded-block 0   mid)
+           ,@(make-guarded-block mid limit)
+           ,result)))))
 
 ;;; the different policies we can use to determine the coding strategy
-(deftype ltn-policy ()
-  '(member :safe :small :fast :fast-safe))
+(def!type ltn-policy ()
+  '(member :safe :small :small-safe :fast :fast-safe))
 
 ;;;; PRIMITIVE-TYPEs
 
@@ -39,7 +102,7 @@
 ;;; done on the basis of the primitive types of the operands, and the
 ;;; primitive type of a value is used to constrain the possible
 ;;; representations of that value.
-(defstruct (primitive-type (:copier nil))
+(def!struct (primitive-type (:copier nil))
   ;; the name of this PRIMITIVE-TYPE
   (name nil :type symbol :read-only t)
   ;; a list of the SC numbers for all the SCs that a TN of this type
@@ -322,6 +385,8 @@
   (name "<not computed>" :type (or simple-string list symbol))
   ;; the argument list that the function was defined with.
   (arguments nil :type list)
+  ;; the entire lambda expression defining this function
+  (lexpr nil)
   ;; a function type specifier representing the arguments and results
   ;; of this function
   (type 'function :type (or list (member function)))
@@ -350,6 +415,14 @@
   ;; implementations we may use a call instruction that requires the
   ;; return PC to be passed in a particular place.
   (return-pc-pass (missing-arg) :type tn :read-only t)
+  ;; a label that marks the first instruction after the RETURN-PC has
+  ;; been moved from its passing location to its save location.
+  #!-fp-and-pc-standard-save
+  (lra-saved-pc nil :type (or label null))
+  ;; a label that marks the first instruction after the OLD-FP has
+  ;; been moved from its passing location to its save location.
+  #!-fp-and-pc-standard-save
+  (cfp-saved-pc nil :type (or label null))
   ;; True if this function has a frame on the number stack. This is
   ;; set by representation selection whenever it is possible that some
   ;; function in our tail set will make use of the number stack.
@@ -392,7 +465,8 @@
   (count (missing-arg) :type (or index (member :unknown)))
   ;; If count isn't :UNKNOWN, then this is a list of the
   ;; primitive-types of each value.
-  (types () :type list)
+  (primitive-types () :type list)
+  (types nil :type list)
   ;; If kind is :FIXED, then this is the list of the TNs that we
   ;; return the values in.
   (locations () :type list))
@@ -409,10 +483,13 @@
   ;; unwind-block, so we leave this slot null.
   (home nil :type (or tn null))
   ;; the saved control stack pointer
-  (save-sp (missing-arg) :type tn)
+  (save-sp nil :type (or tn null))
   ;; the list of dynamic state save TNs
-  (dynamic-state (list* (make-stack-pointer-tn)
+
+  (dynamic-state #!-x86-64
+                 (list* (make-stack-pointer-tn)
                         (make-dynamic-state-tns))
+                 #!+x86-64 nil
                  :type list)
   ;; the target label for NLX entry
   (target (gen-label) :type label))
@@ -483,11 +560,14 @@
   ;; vice-versa.
   (target nil :type (or null tn-ref))
   ;; the load TN allocated for this operand, if any
-  (load-tn nil :type (or tn null)))
+  (load-tn nil :type (or tn null))
+  ;; The type of the LVAR the TN of this TN-REF is used for.
+  (type nil :type (or ctype null)))
 
 ;;; A TEMPLATE object represents a particular IR2 coding strategy for
 ;;; a known function.
 (def!struct (template (:constructor nil)
+                      (:copier nil)
                       #-sb-xc-host (:pure t))
   ;; the symbol name of this VOP. This is used when printing the VOP
   ;; and is also used to provide a handle for definition and
@@ -560,11 +640,7 @@
 ;;; A VOP-INFO object holds the constant information for a given
 ;;; virtual operation. We include TEMPLATE so that functions with a
 ;;; direct VOP equivalent can be translated easily.
-(def!struct (vop-info (:include template))
-  ;; side effects of this VOP and side effects that affect the value
-  ;; of this VOP
-  (effects (missing-arg) :type attributes)
-  (affected (missing-arg) :type attributes)
+(def!struct (vop-info (:include template) (:copier nil))
   ;; If true, causes special casing of TNs live after this VOP that
   ;; aren't results:
   ;; -- If T, all such TNs that are allocated in a SC with a defined
@@ -695,29 +771,32 @@
 
 ;;; The SB structure represents the global information associated with
 ;;; a storage base.
-(def!struct (sb)
+(def!struct (storage-base (:copier nil) (:conc-name sb-))
   ;; name, for printing and reference
-  (name nil :type symbol)
+  (name nil :type symbol :read-only t)
   ;; the kind of storage base (which determines the packing
   ;; algorithm)
-  (kind :non-packed :type (member :finite :unbounded :non-packed))
+  (kind :non-packed :type (member :finite :unbounded :non-packed) :read-only t)
   ;; the number of elements in the SB. If finite, this is the total
   ;; size. If unbounded, this is the size that the SB is initially
   ;; allocated at.
-  (size 0 :type index))
-(!set-load-form-method sb (:host :xc))
-(defprinter (sb)
-  name)
+  (size 0 :type index :read-only t))
 
 ;;; A FINITE-SB holds information needed by the packing algorithm for
 ;;; finite SBs.
-(def!struct (finite-sb (:include sb))
+(defstruct (finite-sb-template (:include storage-base) (:copier nil)
+                               (:predicate nil) (:conc-name finite-sb-))
+  ;; for indirecting access of read/write slots of this SB into
+  ;; a proxy object specific to one compiler invocation.
+  (index 0 :type (mod #+sb-xc-host 8 ; arbitrary limit
+                      #-sb-xc-host #.(length *finite-sbs*)) :read-only t)
   ;; the minimum number of location by which to grow this SB
   ;; if it is :unbounded
-  (size-increment 1 :type index)
+  (size-increment 1 :type index :read-only t)
   ;; current-size must always be a multiple of this. It is assumed
   ;; to be a power of two.
-  (size-alignment 1 :type index)
+  (size-alignment 1 :type index :read-only t))
+(defstruct (finite-sb (:copier nil) (:predicate nil) (:conc-name fsb-))
   ;; the number of locations currently allocated in this SB
   (current-size 0 :type index)
   ;; the last location packed in, used by pack to scatter TNs to
@@ -735,7 +814,6 @@
   ;; is set, then the location is in use somewhere in the block, and
   ;; thus has a conflict for always-live TNs.
   (always-live '#() :type simple-vector)
-  (always-live-count '#() :type simple-vector)
   ;; a vector containing the TN currently live in each location in the
   ;; SB, or NIL if the location is unused. This is used during load-tn pack.
   (live-tns '#() :type simple-vector)
@@ -743,21 +821,54 @@
   ;; might not be virgin, and thus must be reinitialized when PACK
   ;; starts. Less then the length of those vectors when not all of the
   ;; length was used on the previously packed component.
-  (last-block-count 0 :type index))
+  (last-block-count 0 :type index)
+  (wired-map 0 :type sb!vm:finite-sc-offset-map))
+(declaim (freeze-type storage-base finite-sb-template finite-sb))
 
-;;; the SC structure holds the storage base that storage is allocated
+;;; Give this a toplevel value so that it can be declaimed ALWAYS-BOUND.
+;;; The compiler will never look at the toplevel value though.
+(defvar *finite-sbs*
+  #-sb-xc-host
+  (make-array #.(count :non-packed *backend-sbs* :key #'sb-kind :test #'neq)))
+#-sb-xc-host
+(progn
+  (declaim (type (simple-vector #.(length *finite-sbs*)) *finite-sbs*)
+           (always-bound *finite-sbs*))
+  (eval-when (:compile-toplevel :load-toplevel :execute)
+    (setf (info :variable :wired-tls '*finite-sbs*) :always-thread-local)))
+
+;;; All these are SETFable
+(defmacro finite-sb-current-size (sb)
+  `(fsb-current-size (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-last-offset (sb)
+  `(fsb-last-offset (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-conflicts (sb)
+  `(fsb-conflicts (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-always-live (sb)
+  `(fsb-always-live (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-wired-map (sb)
+  `(fsb-wired-map (svref *finite-sbs* (finite-sb-index ,sb))))
+
+(defmacro finite-sb-live-tns (sb)
+  `(fsb-live-tns (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-last-block-count (sb)
+  `(fsb-last-block-count (svref *finite-sbs* (finite-sb-index ,sb))))
+
+;;; the STORAGE-CLASS structure holds the storage base that storage is allocated
 ;;; in and information used to select locations within the SB
-(def!struct (sc (:copier nil))
+(def!struct (storage-class (:conc-name "SC-") (:copier nil) (:predicate nil))
   ;; name, for printing and reference
   (name nil :type symbol)
   ;; the number used to index SC cost vectors
   (number 0 :type sc-number)
   ;; the storage base that this SC allocates storage from
-  (sb nil :type (or sb null))
+  (sb nil :type (or storage-base null))
   ;; the size of elements in this SC, in units of locations in the SB
   (element-size 0 :type index)
-  ;; if our SB is finite, a list of the locations in this SC
-  (locations nil :type list)
+  ;; if our SB is finite, a vector of the locations in this SC
+  (locations (missing-arg) :type sc-locations :read-only t)
+  ;; information for the assembler when moving to/from the locations
+  (operand-size nil :type (or null keyword) :read-only t)
   ;; a list of the alternate (save) SCs for this SC
   (alternate-scs nil :type list)
   ;; a list of the constant SCs that can me moved into this SC
@@ -770,9 +881,9 @@
   ;; of the corresponding move functions. If loading is impossible,
   ;; then the entries are NIL. LOAD-COSTS is initialized to have a 0
   ;; for this SC.
-  (move-funs (make-array sc-number-limit :initial-element nil)
+  (move-funs (make-array sb!vm:sc-number-limit :initial-element nil)
              :type sc-vector)
-  (load-costs (make-array sc-number-limit :initial-element nil)
+  (load-costs (make-array sb!vm:sc-number-limit :initial-element nil)
               :type sc-vector)
   ;; a vector mapping from SC numbers to possibly
   ;; representation-specific move and coerce VOPs. Each entry is a
@@ -792,30 +903,30 @@
   ;; TNs wired in the standard argument registers, since there may
   ;; already be live TNs wired in those locations holding the values
   ;; that we are setting up for unknown-values return.
-  (move-vops (make-array sc-number-limit :initial-element nil)
+  (move-vops (make-array sb!vm:sc-number-limit :initial-element nil)
              :type sc-vector)
   ;; the costs corresponding to the MOVE-VOPS. Separate because this
   ;; info is needed at meta-compile time, while the MOVE-VOPs don't
   ;; exist till load time. If no move is defined, then the entry is
   ;; NIL.
-  (move-costs (make-array sc-number-limit :initial-element nil)
+  (move-costs (make-array sb!vm:sc-number-limit :initial-element nil)
               :type sc-vector)
   ;; similar to Move-VOPs, except that we only ever use the entries
   ;; for this SC and its alternates, since we never combine complex
   ;; representation conversion with argument passing.
-  (move-arg-vops (make-array sc-number-limit :initial-element nil)
+  (move-arg-vops (make-array sb!vm:sc-number-limit :initial-element nil)
                  :type sc-vector)
   ;; true if this SC or one of its alternates in in the NUMBER-STACK SB.
   (number-stack-p nil :type boolean)
   ;; alignment restriction. The offset must be an even multiple of this.
   ;; this must be a power of two.
   (alignment 1 :type (and index (integer 1)))
-  ;; a list of locations that we avoid packing in during normal
+  ;; a vector of locations that we avoid packing in during normal
   ;; register allocation to ensure that these locations will be free
   ;; for operand loading. This prevents load-TN packing from thrashing
   ;; by spilling a lot.
-  (reserve-locations nil :type list))
-(defprinter (sc)
+  (reserve-locations (missing-arg) :type sc-locations :read-only t))
+(defprinter (storage-class :conc-name "SC-")
   name)
 
 ;;;; TNs
@@ -878,13 +989,23 @@
   ;;    as :NORMAL, but then at the end merges the conflict info into
   ;;    the original TN and replaces all uses of the alias with the
   ;;    original TN. SAVE-TN holds the aliased TN.
+  ;;   :UNUSED
+  ;;    Unused result
   (kind (missing-arg)
         :type (member :normal :environment :debug-environment
-                      :save :save-once :specified-save :load :constant
-                      :component :alias))
+                      :save :save-once  :load :constant
+                      :component :alias :unused
+                      #!-fp-and-pc-standard-save :specified-save
+                      :arg-pass))
   ;; the primitive-type for this TN's value. Null in restricted or
   ;; wired TNs.
   (primitive-type nil :type (or primitive-type null))
+  ;; The type of the LVAR this TN is used for.
+  ;; Meaningless after copy-propagate or other optimizations are performed
+  ;; and TN-REF-TYPE should be used instead.
+  ;; The only purpose of this slot is for REFERENCE-TN to populate
+  ;; TN-REF-TYPE.
+  (type nil :type (or ctype null))
   ;; If this TN represents a variable or constant, then this is the
   ;; corresponding LEAF.
   (leaf nil :type (or leaf null))
@@ -931,7 +1052,7 @@
   (save-tn nil :type (or tn null))
   ;; After pack, the SC we packed into. Beforehand, the SC we want to
   ;; pack into, or null if we don't know.
-  (sc nil :type (or sc null))
+  (sc nil :type (or storage-class null))
   ;; the offset within the SB that this TN is packed into. This is what
   ;; indicates that the TN is packed
   (offset nil :type (or index null))
@@ -940,14 +1061,18 @@
   ;; If a :ENVIRONMENT or :DEBUG-ENVIRONMENT TN, this is the
   ;; physical environment that the TN is live throughout.
   (physenv nil :type (or physenv null))
-  ;; The depth of the deepest loop that this TN is used in.
-  (loop-depth 0 :type fixnum))
+  ;; Used by pack-iterative
+  vertex)
+
 (declaim (freeze-type tn))
 (defmethod print-object ((tn tn) stream)
-  (print-unreadable-object (tn stream :type t)
+  (cond ((not (boundp 'sb!c::*compiler-ir-obj-map*))
+         (print-unreadable-object (tn stream :type t :identity t)))
+        (t
+         (print-unreadable-object (tn stream :type t)
     ;; KLUDGE: The distinction between PRINT-TN and PRINT-OBJECT on TN is
     ;; not very mnemonic. -- WHN 20000124
-    (print-tn-guts tn stream)))
+           (print-tn-guts tn stream)))))
 
 ;;; The GLOBAL-CONFLICTS structure represents the conflicts for global
 ;;; TNs. Each global TN has a list of these structures, one for each

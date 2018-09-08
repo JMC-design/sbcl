@@ -17,7 +17,7 @@
             (:constructor make-core-object ())
             #-no-ansi-print-object
             (:print-object (lambda (x s)
-                             (print-unreadable-object (x s :type t))))
+                             (print-unreadable-object (x s :type t :identity t))))
             (:copier nil))
   ;; A hashtable translating ENTRY-INFO structures to the corresponding actual
   ;; FUNCTIONs for functions in this compilation.
@@ -30,70 +30,6 @@
   ;; backpatch with the source info.
   (debug-info () :type list))
 
-;;; Note the existence of FUNCTION.
-#-sb-xc-host ; There is no (SETF CODE-HEADER-REF) so this can't work.
-(defun note-fun (info function object)
-  (declare (type function function)
-           (type core-object object))
-  (let ((patch-table (core-object-patch-table object)))
-    (dolist (patch (gethash info patch-table))
-      (setf (code-header-ref (car patch) (the index (cdr patch))) function))
-    (remhash info patch-table))
-  (setf (gethash info (core-object-entry-table object)) function)
-  (values))
-
-;;; Do "load-time" fixups on the code vector.
-;;; But the host never compiles to core, and there is no GET-LISP-OBJ-ADDRESS,
-;;; FIXUP-CODE-OBJECT, or ENSURE-SYMBOL-TLS-INDEX.
-#-sb-xc-host
-(defun do-core-fixups (code fixup-notes)
-  (declare (list fixup-notes))
-  (dolist (note fixup-notes)
-    (let* ((kind (fixup-note-kind note))
-           (fixup (fixup-note-fixup note))
-           (position (fixup-note-position note))
-           (name (fixup-name fixup))
-           (flavor (fixup-flavor fixup))
-           (value (ecase flavor
-                    (:assembly-routine
-                     (aver (symbolp name))
-                     (or (gethash name *assembler-routines*)
-                         (error "undefined assembler routine: ~S" name)))
-                    (:foreign
-                     (aver (stringp name))
-                     ;; FOREIGN-SYMBOL-ADDRESS signals an error
-                     ;; if the symbol isn't found.
-                     (foreign-symbol-address name))
-                    #!+linkage-table
-                    (:foreign-dataref
-                     (aver (stringp name))
-                     (foreign-symbol-address name t))
-                    #!+(or x86 x86-64)
-                    (:code-object
-                     (aver (null name))
-                     (get-lisp-obj-address code))
-                    #!+immobile-code
-                    (:static-call
-                     (sb!vm::function-raw-address name))
-                    (:symbol-tls-index
-                     (aver (symbolp name))
-                     (ensure-symbol-tls-index name)))))
-      (sb!vm:fixup-code-object code position value kind))))
-
-;;; Stick a reference to the function FUN in CODE-OBJECT at index I. If the
-;;; function hasn't been compiled yet, make a note in the patch table.
-#-sb-xc-host ; no (SETF CODE-HEADER-REF)
-(defun reference-core-fun (code-obj i fun object)
-  (declare (type core-object object) (type functional fun)
-           (type index i))
-  (let* ((info (leaf-info fun))
-         (found (gethash info (core-object-entry-table object))))
-    (if found
-        (setf (code-header-ref code-obj i) found)
-        (push (cons code-obj i)
-              (gethash info (core-object-patch-table object)))))
-  (values))
-
 ;;; Call the top level lambda function dumped for ENTRY, returning the
 ;;; values. ENTRY may be a :TOPLEVEL-XEP functional.
 (defun core-call-toplevel-lambda (entry object)
@@ -102,36 +38,28 @@
                         (core-object-entry-table object))
                (error "Unresolved forward reference."))))
 
-;;; Backpatch all the DEBUG-INFOs dumped so far with the specified
-;;; SOURCE-INFO list. We also check that there are no outstanding
-;;; forward references to functions.
-(defun fix-core-source-info (info object &optional function)
-  (declare (type core-object object)
-           (type (or null function) function))
-  (aver (zerop (hash-table-count (core-object-patch-table object))))
-  (let ((source (debug-source-for-info info :function function)))
-    (dolist (info (core-object-debug-info object))
-      (setf (debug-info-source info) source)))
-  (setf (core-object-debug-info object) nil)
-  (values))
-
 #!+(and immobile-code (host-feature sb-xc))
 (progn
-(defvar *linker-fixups*)
-(defun sb!vm::function-raw-address (name &optional (fun (awhen (find-fdefn name)
-                                                          (fdefn-fun it))))
-  (let ((addr (and fun (get-lisp-obj-address fun))))
-    (cond (addr
-           (cond ((not (<= sb!vm:immobile-space-start addr sb!vm:immobile-space-end))
-                  (error "Can't statically link to ~S: code is movable" name))
-                 ((neq (fun-subtype fun) sb!vm:simple-fun-header-widetag)
-                  (error "Can't statically link to ~S: non-simple function" name))
-                 (t
-                  (sap-ref-word (int-sap addr)
-                                (- (ash sb!vm:simple-fun-self-slot sb!vm:word-shift)
-                                   sb!vm:fun-pointer-lowtag)))))
-          ((boundp '*linker-fixups*)
-           (warn "Deferring linkage to ~S" name)
-           (cons :defer name))
+  ;; Use FDEFINITION because it strips encapsulations - whether that's
+  ;; the right behavior for it or not is a separate concern.
+  ;; If somebody tries (TRACE LENGTH) for example, it should not cause
+  ;; compilations to fail on account of LENGTH becoming a closure.
+  (defun sb!vm::function-raw-address (name &aux (fun (fdefinition name)))
+    (cond ((not fun)
+           (error "Can't statically link to undefined function ~S" name))
+          ((not (immobile-space-obj-p fun))
+           (error "Can't statically link to ~S: code is movable" name))
+          ((neq (fun-subtype fun) sb!vm:simple-fun-widetag)
+           (error "Can't statically link to ~S: non-simple function" name))
           (t
-           (error "Can't statically link to undefined function ~S" name))))))
+           (let ((addr (get-lisp-obj-address fun)))
+             (sap-ref-word (int-sap addr)
+                           (- (ash sb!vm:simple-fun-self-slot sb!vm:word-shift)
+                              sb!vm:fun-pointer-lowtag))))))
+
+  ;; Return the address to which to jump when calling NAME through its fdefn.
+  (defun sb!vm::fdefn-entry-address (name)
+    (let ((fdefn (find-or-create-fdefn name)))
+      (+ (get-lisp-obj-address fdefn)
+         (ash sb!vm:fdefn-raw-addr-slot sb!vm:word-shift)
+         (- sb!vm:other-pointer-lowtag)))))

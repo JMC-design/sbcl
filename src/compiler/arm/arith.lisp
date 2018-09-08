@@ -14,9 +14,7 @@
 ;;;; unary operations.
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg)))
@@ -136,10 +134,11 @@
                           `(inst ,op r y x)
                           `(inst ,op r x y))))
        (define-vop (,(symbolicate 'fast- translate '-c/fixnum=>fixnum)
-                     fast-fixnum-binop-c)
+                    fast-fixnum-binop-c)
+         ,@(when invert-r `((:temporary (:sc non-descriptor-reg :target r) temp)))
          (:translate ,translate)
          (:generator 1
-          (composite-immediate-instruction ,cop r x y :fixnumize t :neg-op ,neg-op :invert-y ,invert-y :invert-r ,invert-r :single-op-op ,(when try-single-op op))))
+          (composite-immediate-instruction ,cop r x y :fixnumize t :neg-op ,neg-op :invert-y ,invert-y :invert-r ,invert-r ,@(when invert-r `(:temporary temp)) :single-op-op ,(when try-single-op op))))
        (define-vop (,(symbolicate 'fast- translate '/signed=>signed)
                      fast-signed-binop)
          (:translate ,translate)
@@ -318,6 +317,8 @@
            (if (plusp amount)
                (inst mov result (lsl number amount))
                (inst mov result (asr number (- amount)))))
+          ((<= amount -32)
+           (inst mov result (asr number 31)))
           (t
            (inst mov result 0)))))
 
@@ -399,7 +400,6 @@
              fast-ash-left/unsigned=>unsigned)
   (:translate ash-left-mod32))
 
-#!+ash-right-vops
 (define-vop (fast-%ash/right/unsigned)
   (:translate %ash/right)
   (:policy :fast-safe)
@@ -411,7 +411,6 @@
   (:generator 4
     (inst mov result (lsr number amount))))
 
-#!+ash-right-vops
 (define-vop (fast-%ash/right/signed)
   (:translate %ash/right)
   (:policy :fast-safe)
@@ -423,7 +422,6 @@
   (:generator 4
     (inst mov result (asr number amount))))
 
-#!+ash-right-vops
 (define-vop (fast-%ash/right/fixnum)
   (:translate %ash/right)
   (:policy :fast-safe)
@@ -549,8 +547,6 @@
 
 (define-vop (fast-conditional)
   (:conditional :eq)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -869,7 +865,6 @@
   (:generator 1
     (inst umull lo hi x y)))
 
-#!+multiply-high-vops
 (define-vop (mulhi)
   (:translate %multiply-high)
   (:policy :fast-safe)
@@ -882,7 +877,6 @@
   (:generator 20
     (inst umull lo hi x y)))
 
-#!+multiply-high-vops
 (define-vop (mulhi/fx)
   (:translate %multiply-high)
   (:policy :fast-safe)
@@ -952,26 +946,3 @@
   (:translate sb!bignum:%ashl)
   (:generator 1
     (inst mov result (lsl digit count))))
-
-;;;; Static functions.
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-+ (x y) :translate +)
-(define-static-fun two-arg-- (x y) :translate -)
-(define-static-fun two-arg-* (x y) :translate *)
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-< (x y) :translate <)
-(define-static-fun two-arg-> (x y) :translate >)
-(define-static-fun two-arg-= (x y) :translate =)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-(define-static-fun two-arg-eqv (x y) :translate logeqv)
-
-(define-static-fun eql (x y) :translate eql)
-
-(define-static-fun %negate (x) :translate %negate)

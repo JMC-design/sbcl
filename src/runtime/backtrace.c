@@ -33,6 +33,7 @@
 #include "genesis/primitive-objects.h"
 #include "thread.h"
 #include "gc-internal.h"
+#include "var-io.h"
 
 #ifdef LISP_FEATURE_OS_PROVIDES_DLADDR
 # include <dlfcn.h>
@@ -52,6 +53,15 @@ sbcl_putwc(wchar_t c, FILE *file)
 #endif
 }
 
+unsigned int decode_elsewhere_pc(lispobj packed_integer)
+{
+    struct varint_unpacker unpacker;
+    int value;
+    varint_unpacker_init(&unpacker, packed_integer);
+    varint_unpack(&unpacker, &value);
+    return value;
+}
+
 struct compiled_debug_fun *
 debug_function_from_pc (struct code* code, void *pc)
 {
@@ -63,19 +73,19 @@ debug_function_from_pc (struct code* code, void *pc)
     struct vector *v;
     int i, len;
 
-    if (lowtag_of(code->debug_info) != INSTANCE_POINTER_LOWTAG)
+    if (!instancep(code->debug_info))
         return NULL;
 
     di = (struct compiled_debug_info *) native_pointer(code->debug_info);
 
-    if (lowtag_of(di->fun_map) != INSTANCE_POINTER_LOWTAG)
+    if (!instancep(di->fun_map))
         return NULL;
 
-    v = (struct vector *) native_pointer(di->fun_map);
+    v = VECTOR(di->fun_map);
 
     len = fixnum_value(v->length);
 
-    if (lowtag_of(v->data[0]) != INSTANCE_POINTER_LOWTAG)
+    if (!instancep(v->data[0]))
         return NULL;
 
     df = (struct compiled_debug_fun *) native_pointer(v->data[0]);
@@ -89,10 +99,10 @@ debug_function_from_pc (struct code* code, void *pc)
         if (i == len)
             return ((struct compiled_debug_fun *) native_pointer(v->data[i - 1]));
 
-        if (offset >= (uword_t)fixnum_value(df->elsewhere_pc)) {
+        if (offset >= (uword_t)decode_elsewhere_pc(df->encoded_locs)) {
             struct compiled_debug_fun *p
                 = ((struct compiled_debug_fun *) native_pointer(v->data[i + 1]));
-            next_pc = fixnum_value(p->elsewhere_pc);
+            next_pc = decode_elsewhere_pc(p->encoded_locs);
         } else
             next_pc = fixnum_value(v->data[i]);
 
@@ -104,10 +114,9 @@ debug_function_from_pc (struct code* code, void *pc)
 }
 
 static void
-print_string (lispobj *object)
+print_string (struct vector *vector, FILE *f)
 {
-  int tag = widetag_of(*object);
-  struct vector *vector = (struct vector *) object;
+  int tag = widetag_of(&vector->header);
 
 #define doit(TYPE)                              \
   do {                                          \
@@ -117,8 +126,8 @@ print_string (lispobj *object)
     for (i = 0; i < n; i++) {                   \
       wchar_t c = (wchar_t) data[i];            \
       if (c == '\\' || c == '"')                \
-        putchar('\\');                          \
-      sbcl_putwc(c, stdout);                    \
+        putc('\\', f);                          \
+      sbcl_putwc(c, f);                         \
     }                                           \
   } while (0)
 
@@ -132,87 +141,83 @@ print_string (lispobj *object)
     break;
 #endif
   default:
-    printf("<??? type %d>", tag);
+    fprintf(f, "<??? type %d>", tag);
   }
 #undef doit
 }
 
-static int string_equal (lispobj *object, char *string)
+static int string_equal (struct vector *vector, char *string)
 {
-    int tag = widetag_of(*object);
-    struct vector *vector = (struct vector *) object;
-
-    if (tag != SIMPLE_BASE_STRING_WIDETAG)
+    if (widetag_of(&vector->header) != SIMPLE_BASE_STRING_WIDETAG)
         return 0;
     return !strcmp((char *) vector->data, string);
 }
 
 static void
-print_entry_name (lispobj name)
+print_entry_name (lispobj name, FILE *f)
 {
-    if (lowtag_of (name) == LIST_POINTER_LOWTAG) {
-        putchar('(');
+    if (listp(name)) {
+        putc('(', f);
         while (name != NIL) {
-            if (lowtag_of (name) != LIST_POINTER_LOWTAG) {
-                printf("%p: unexpected lowtag while printing a cons\n",
+            if (!listp(name)) {
+                fprintf(f, "%p: unexpected lowtag while printing a cons\n",
                        (void*)name);
                 return;
             }
-            struct cons *cons = (struct cons *) native_pointer(name);
-            print_entry_name(cons->car);
-            name = cons->cdr;
+            print_entry_name(CONS(name)->car, f);
+            name = CONS(name)->cdr;
             if (name != NIL)
-                putchar(' ');
+                putc(' ', f);
         }
-        putchar(')');
+        putc(')', f);
     } else if (lowtag_of(name) == OTHER_POINTER_LOWTAG) {
-        lispobj *object = (lispobj *) native_pointer(name);
-        if (widetag_of(*object) == SYMBOL_HEADER_WIDETAG) {
+        lispobj *object = native_pointer(name);
+        if (widetag_of(object) == SYMBOL_WIDETAG) {
             struct symbol *symbol = (struct symbol *) object;
             if (symbol->package != NIL) {
                 struct package *pkg
                     = (struct package *) native_pointer(symbol->package);
-                lispobj pkg_name = pkg->_name;
-                if (string_equal(native_pointer(pkg_name), "COMMON-LISP"))
+                struct vector *pkg_name = VECTOR(pkg->_name);
+                if (string_equal(pkg_name, "COMMON-LISP"))
                     ;
-                else if (string_equal(native_pointer(pkg_name), "COMMON-LISP-USER")) {
-                    fputs("CL-USER::", stdout);
+                else if (string_equal(pkg_name, "COMMON-LISP-USER")) {
+                    fputs("CL-USER::", f);
                 }
-                else if (string_equal(native_pointer(pkg_name), "KEYWORD")) {
-                    putchar(':');
+                else if (string_equal(pkg_name, "KEYWORD")) {
+                    putc(':', f);
                 } else {
-                    print_string(native_pointer(pkg_name));
-                    fputs("::", stdout);
+                    print_string(pkg_name, f);
+                    fputs("::", f);
                 }
             }
-            print_string(native_pointer(symbol->name));
-        } else if (widetag_of(*object) == SIMPLE_BASE_STRING_WIDETAG
+            print_string(VECTOR(symbol->name), f);
+        } else if (widetag_of(object) == SIMPLE_BASE_STRING_WIDETAG
 #ifdef SIMPLE_CHARACTER_STRING_WIDETAG
-                   || widetag_of(*object) == SIMPLE_CHARACTER_STRING_WIDETAG
+                   || widetag_of(object) == SIMPLE_CHARACTER_STRING_WIDETAG
 #endif
             ) {
-            putchar('"');
-            print_string(object);
-            putchar('"');
+            putc('"', f);
+            print_string((struct vector*)object, f);
+            putc('"', f);
         } else {
-            printf("<??? type %d>", (int) widetag_of(*object));
+            fprintf(f, "<??? type %d>", widetag_of(object));
         }
     } else {
-        printf("<??? lowtag %d>", (int) lowtag_of(name));
+        fprintf(f, "<??? lowtag %d>", (int) lowtag_of(name));
     }
 }
 
 static void
-print_entry_points (struct code *code)
+print_entry_points (struct code *code, FILE *f)
 {
     int n_funs = code_n_funs(code);
     for_each_simple_fun(index, fun, code, 0, {
-        if (widetag_of(fun->header) != SIMPLE_FUN_HEADER_WIDETAG) {
-            printf("%p: bogus function entry", fun);
+        if (widetag_of(&fun->header) != SIMPLE_FUN_WIDETAG) {
+            fprintf(f, "%p: bogus function entry", fun);
             return;
         }
-        print_entry_name(fun->name);
-        if ((index + 1) < n_funs) printf (", ");
+        print_entry_name(fun->name, f);
+        if ((index + 1) < n_funs) fprintf(f, ", ");
     });
 }
 
@@ -256,19 +261,14 @@ static int previous_info(struct call_info *info);
 static struct code *
 code_pointer(lispobj object)
 {
-    lispobj *headerp, header;
-    int type, len;
-
-    headerp = (lispobj *) native_pointer(object);
-    header = *headerp;
-    type = widetag_of(header);
-
-    switch (type) {
+    lispobj *headerp = native_pointer(object);
+    int len;
+    switch (widetag_of(headerp)) {
         case CODE_HEADER_WIDETAG:
             break;
-        case RETURN_PC_HEADER_WIDETAG:
-        case SIMPLE_FUN_HEADER_WIDETAG:
-            len = HEADER_LENGTH(header);
+        case RETURN_PC_WIDETAG:
+        case SIMPLE_FUN_WIDETAG:
+            len = HEADER_LENGTH(*headerp);
             if (len == 0)
                 headerp = NULL;
             else
@@ -308,8 +308,7 @@ call_info_from_context(struct call_info *info, os_context_t *context)
 
     info->interrupted = 1;
 #if !defined(LISP_FEATURE_ARM) && !defined(LISP_FEATURE_ARM64)
-    if (lowtag_of(*os_context_register_addr(context, reg_CODE))
-        == FUN_POINTER_LOWTAG) {
+    if (functionp(*os_context_register_addr(context, reg_CODE))) {
         /* We tried to call a function, but crapped out before $CODE could
          * be fixed up. Probably an undefined function. */
         info->frame =
@@ -349,7 +348,7 @@ previous_info(struct call_info *info)
     lispobj lra;
 
     if (!cs_valid_pointer_p(info->frame)) {
-        printf("Bogus callee value (0x%08lx).\n", (uword_t)info->frame);
+        printf("Bogus callee value (0x%lx).\n", (long)info->frame);
         return 0;
     }
 
@@ -363,10 +362,9 @@ previous_info(struct call_info *info)
     lra = info->lra;
     if (lra == NIL) {
         /* We were interrupted. Find the correct signal context. */
-        free_ici = fixnum_value(SymbolValue(FREE_INTERRUPT_CONTEXT_INDEX,thread));
+        free_ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,thread));
         while (free_ici-- > 0) {
-            os_context_t *context =
-                thread->interrupt_contexts[free_ici];
+            os_context_t *context = nth_interrupt_context(free_ici, thread);
             if ((struct call_frame *)(uword_t)
                 (*os_context_register_addr(context, reg_CFP))
                 == info->frame) {
@@ -410,9 +408,9 @@ lisp_backtrace(int nframes)
             struct compiled_debug_fun *df ;
             if (info.lra != NIL &&
                 (df = debug_function_from_pc((struct code *)info.code, (void *)info.lra)))
-                print_entry_name(df->name);
+                print_entry_name(df->name, stdout);
             else
-                print_entry_points((struct code *)info.code);
+                print_entry_points((struct code *)info.code, stdout);
 
             printf(" %p", (void*)((uword_t) info.code | OTHER_POINTER_LOWTAG));
         }
@@ -436,12 +434,12 @@ lisp_backtrace(int nframes)
 #else
 
 static int
-altstack_pointer_p (void *p) {
+altstack_pointer_p (void __attribute__((unused)) *p) {
 #ifndef LISP_FEATURE_WIN32
-    void* stack_start = ((void *)arch_os_get_current_thread()) + dynamic_values_bytes;
-    void* stack_end = stack_start + 32*SIGSTKSZ;
-
-    return (p > stack_start && p <= stack_end);
+    struct thread* thread = arch_os_get_current_thread();
+    // FIXME: shouldn't this be testing '>=' start and '<' end ?
+    //        i.e. Was it only right because the calculations themselves were wrong ?
+    return (p > calc_altstack_base(thread) && p <= calc_altstack_end(thread));
 #else
     /* Win32 doesn't do altstack */
     return 0;
@@ -510,10 +508,10 @@ x86_call_context (void *fp, void **ra, void **ocfp)
 void
 describe_thread_state(void)
 {
-    sigset_t mask;
     struct thread *thread = arch_os_get_current_thread();
     struct interrupt_data *data = thread->interrupt_data;
 #ifndef LISP_FEATURE_WIN32
+    sigset_t mask;
     get_current_sigmask(&mask);
     printf("Signal mask:\n");
     printf(" SIGALRM = %d\n", sigismember(&mask, SIGALRM));
@@ -524,43 +522,40 @@ describe_thread_state(void)
 #endif
 #endif
     printf("Specials:\n");
-    printf(" *GC-INHIBIT* = %s\n", (SymbolValue(GC_INHIBIT, thread) == T) ? "T" : "NIL");
-    printf(" *GC-PENDING* = %s\n",
-           (SymbolValue(GC_PENDING, thread) == T) ?
-           "T" : ((SymbolValue(GC_PENDING, thread) == NIL) ?
-                  "NIL" : ":IN-PROGRESS"));
-    printf(" *INTERRUPTS-ENABLED* = %s\n", (SymbolValue(INTERRUPTS_ENABLED, thread) == T) ? "T" : "NIL");
+    printf(" *GC-INHIBIT* = %s\n", (read_TLS(GC_INHIBIT, thread) == T) ? "T" : "NIL");
+    printf(" *GC-PENDING* = %s\n", (read_TLS(GC_PENDING, thread) == T) ? "T" : "NIL");
+    printf(" *INTERRUPTS-ENABLED* = %s\n", (read_TLS(INTERRUPTS_ENABLED, thread) == T) ? "T" : "NIL");
 #ifdef STOP_FOR_GC_PENDING
-    printf(" *STOP-FOR-GC-PENDING* = %s\n", (SymbolValue(STOP_FOR_GC_PENDING, thread) == T) ? "T" : "NIL");
+    printf(" *STOP-FOR-GC-PENDING* = %s\n", (read_TLS(STOP_FOR_GC_PENDING, thread) == T) ? "T" : "NIL");
 #endif
     printf("Pending handler = %p\n", data->pending_handler);
 }
 
-void print_backtrace_frame(void *pc, void *fp, int i) {
+static void print_backtrace_frame(void *pc, void *fp, int i, FILE *f) {
     lispobj *p;
-    printf("%4d: ", i);
+    fprintf(f, "%4d: ", i);
 
-    p = (lispobj *) component_ptr_from_pc((lispobj *) pc);
+    p = component_ptr_from_pc((lispobj *) pc);
 
     if (p) {
         struct code *cp = (struct code *) p;
         struct compiled_debug_fun *df = debug_function_from_pc(cp, pc);
         if (df)
-            print_entry_name(df->name);
+            print_entry_name(df->name, f);
         else
-            print_entry_points(cp);
-        printf(", pc = %p, fp = %p", pc, fp);
+            print_entry_points(cp, f);
+        fprintf(f, ", pc = %p, fp = %p", pc, fp);
     } else {
 #ifdef LISP_FEATURE_OS_PROVIDES_DLADDR
         Dl_info info;
         if (dladdr(pc, &info)) {
-            printf("Foreign function %s, pc = %p, fp = %p", info.dli_sname, pc, fp);
+            fprintf(f, "Foreign function %s, pc = %p, fp = %p", info.dli_sname, pc, fp);
         } else
 #endif
-            printf("Foreign function, pc = %p, fp = %p", pc, fp);
+            fprintf(f, "Foreign function, pc = %p, fp = %p", pc, fp);
     }
 
-    putchar('\n');
+    putc('\n', f);
 }
 
 /* This function has been split from lisp_backtrace() to enable Lisp
@@ -568,7 +563,7 @@ void print_backtrace_frame(void *pc, void *fp, int i) {
  * example when debugging threading deadlocks.
  */
 void
-backtrace_from_fp(void *fp, int nframes, int start)
+log_backtrace_from_fp(void *fp, int nframes, int start, FILE *f)
 {
   int i = start;
 
@@ -578,9 +573,12 @@ backtrace_from_fp(void *fp, int nframes, int start)
 
     if (!x86_call_context(fp, &ra, &next_fp))
       break;
-    print_backtrace_frame(ra, next_fp, i);
+    print_backtrace_frame(ra, next_fp, i, f);
     fp = next_fp;
   }
+}
+void backtrace_from_fp(void *fp, int nframes, int start) {
+    log_backtrace_from_fp(fp, nframes, start, stdout);
 }
 
 void backtrace_from_context(os_context_t *context, int nframes) {
@@ -589,7 +587,7 @@ void backtrace_from_context(os_context_t *context, int nframes) {
 #elif defined (LISP_FEATURE_X86_64)
     void *fp = (void *)*os_context_register_addr(context,reg_RBP);
 #endif
-    print_backtrace_frame((void *)*os_context_pc_addr(context), fp, 0);
+    print_backtrace_frame((void *)*os_context_pc_addr(context), fp, 0, stdout);
     backtrace_from_fp(fp, nframes - 1, 1);
 }
 
@@ -597,10 +595,10 @@ void
 lisp_backtrace(int nframes)
 {
     struct thread *thread=arch_os_get_current_thread();
-    int free_ici = fixnum_value(SymbolValue(FREE_INTERRUPT_CONTEXT_INDEX,thread));
+    int free_ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,thread));
 
     if (free_ici) {
-        os_context_t *context = thread->interrupt_contexts[free_ici - 1];
+        os_context_t *context = nth_interrupt_context(free_ici - 1, thread);
         backtrace_from_context(context, nframes);
     } else {
         void *fp;

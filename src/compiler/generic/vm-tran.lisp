@@ -31,12 +31,13 @@
   '(if (< x 0) (- x) x))
 
 (deftransform make-symbol ((string) (simple-string))
-  `(%make-symbol string nil))
+  `(%make-symbol 0 string))
 
 #!-immobile-space
-(define-source-transform %make-symbol (string kind)
+(define-source-transform %make-symbol (kind string)
   (declare (ignore kind))
-  `(sb!vm::%%make-symbol ,string))
+  ;; Set "logically read-only" bit in pname.
+  `(sb!vm::%%make-symbol (set-header-data ,string ,sb!vm:+vector-shareable+)))
 
 ;;; We don't want to clutter the bignum code.
 #!+(or x86 x86-64)
@@ -158,7 +159,7 @@
                             (reduce #'* dims))))
         `(data-vector-ref (truly-the (simple-array ,(type-specifier el-type)
                                                    (,total-size))
-                                     (%array-data-vector array))
+                                     (%array-data array))
                           index)))))
 
 ;;; Transform data vector access to a form that opens up optimization
@@ -194,14 +195,16 @@
     (if (array-type-p ctype)
         ;; the other transform will kick in, so that's OK
         (give-up-ir1-transform)
-        `(etypecase string
-          ((simple-array character (*))
-           (data-vector-set string index new-value))
-          #!+sb-unicode
-          ((simple-array base-char (*))
-           (data-vector-set string index new-value))
-          ((simple-array nil (*))
-           (%type-check-error/c string 'nil-array-accessed-error))))))
+        `(typecase string
+           ((simple-array character (*))
+            (data-vector-set string index (the* (character :context :aref) new-value)))
+           #!+sb-unicode
+           ((simple-array base-char (*))
+            (data-vector-set string index (the* (base-char :context :aref
+                                                           :silent-conflict t)
+                                                new-value)))
+           (t
+            (%type-check-error/c string 'nil-array-accessed-error nil))))))
 
 ;;; This and the corresponding -REF transform work equally well on non-simple
 ;;; arrays, but after benchmarking (on x86), Nikodemus didn't find any cases
@@ -246,7 +249,7 @@
                             (reduce #'* dims))))
         `(data-vector-set (truly-the (simple-array ,(type-specifier el-type)
                                                    (,total-size))
-                                     (%array-data-vector array))
+                                     (%array-data array))
                           index
                           new-value)))))
 
@@ -299,7 +302,7 @@
 (deftransform array-storage-vector ((array) ((simple-array * (*))))
   'array)
 
-(defoptimizer (%array-data-vector derive-type) ((array))
+(defoptimizer (%array-data derive-type) ((array))
   (let ((atype (lvar-type array)))
     (when (array-type-p atype)
       (specifier-type (or
@@ -343,7 +346,7 @@
   (upgraded-element-type-specifier-or-give-up %array)
 
   '(if (array-header-p %array)
-       (values (%array-data-vector %array) %index)
+       (values (%array-data %array) %index)
        (values %array %index)))
 
 ;;;; BIT-VECTOR hackery
@@ -606,6 +609,13 @@
               ((simple-unboxed-array (*)) (vector-sap thing)))))
      (declare (inline sapify))
     (with-pinned-objects (dst src)
+      ;; Prevent failure caused by memmove() hitting a write-protected page
+      ;; and the fault handler losing, since it thinks you're not in Lisp.
+      ;; This is wasteful, but better than being randomly broken (lp#1366263).
+      #!+cheneygc
+      (let ((dst (sapify dst)))
+        (setf (sap-ref-8 dst dst-start) (sap-ref-8 dst dst-start)
+              (sap-ref-8 dst (1- dst-end)) (sap-ref-8 dst (1- dst-end))))
       (memmove (sap+ (sapify dst) dst-start)
                (sap+ (sapify src) src-start)
                (- dst-end dst-start)))
@@ -773,3 +783,15 @@
 (deftransform sb!vm::get-lisp-obj-address ((obj) ((constant-arg character)))
   (logior sb!vm::character-widetag
           (ash (char-code (lvar-value obj)) sb!vm::n-widetag-bits)))
+
+;; So that the PCL code walker doesn't observe any use of %PRIMITIVE,
+;; MAKE-UNBOUND-MARKER is an ordinary function, not a macro.
+#-sb-xc-host
+(defun make-unbound-marker () ; for interpreters
+  (sb!sys:%primitive make-unbound-marker))
+;; Get the main compiler to transform MAKE-UNBOUND-MARKER
+;; without the fopcompiler seeing it - the fopcompiler does
+;; expand compiler-macros, but not source-transforms -
+;; because %PRIMITIVE is not generally fopcompilable.
+(sb!c:define-source-transform make-unbound-marker ()
+  `(sb!sys:%primitive make-unbound-marker))

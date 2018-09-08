@@ -13,7 +13,7 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(reg-tn-encoding) 'sb!vm)
+  (import '(reg-tn-encoding) "SB!VM")
   ;; Imports from SB-VM into this package
   (import '(;; SBs and SCs
             sb!vm::zero sb!vm::immediate-constant
@@ -25,7 +25,6 @@
             sb!vm::zero-offset sb!vm::null-offset sb!vm::alloc-offset)))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf *assem-scheduler-p* t)
   (setf *assem-max-locations* 100))
 
 ;;; Constants, types, conversion functions, some disassembler stuff.
@@ -54,7 +53,6 @@
            (tn-offset tn)))))
 
 (defvar *disassem-use-lisp-reg-names* t
-  #!+sb-doc
   "If non-NIL, print registers using the Lisp register names.
 Otherwise, use the Sparc register names")
 
@@ -99,14 +97,14 @@ Otherwise, use the Sparc register names")
            (cond ((null name) nil)
                  (t (make-symbol (concatenate 'string "%" name)))))
        sb!vm::*register-names*)
-  #!+sb-doc "The Lisp names for the Sparc integer registers")
+  "The Lisp names for the Sparc integer registers")
 
 (defparameter sparc-reg-symbols
   #("%G0" "%G1" "%G2" "%G3" "%G4" "%G5" NIL NIL
     "%O0" "%O1" "%O2" "%O3" "%O4" "%O5" "%O6" "%O7"
     "%L0" "%L1" "%L2" "%L3" "%L4" "%L5" "%L6" "%L7"
     "%I0" "%I1" "%I2" "%I3" "%I4" "%I5" NIL "%I7")
-  #!+sb-doc "The standard names for the Sparc integer registers")
+  "The standard names for the Sparc integer registers")
 
 (defun get-reg-name (index)
   (if *disassem-use-lisp-reg-names*
@@ -621,9 +619,6 @@ about function addresses and register values.")
 
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
-
-(define-bitfield-emitter emit-short 16
-  (byte 16 0))
 
 (define-bitfield-emitter emit-format-1 32
   (byte 2 30) (byte 30 0))
@@ -1608,22 +1603,12 @@ about function addresses and register values.")
      (integer
       (emit-word segment word)))))
 
-(define-instruction short (segment short)
-  (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))
-  :pinned
-  (:delay 0)
-  (:emitter
-   (emit-short segment short)))
-
 (define-instruction byte (segment byte)
   (:declare (type (or (unsigned-byte 8) (signed-byte 8)) byte))
   :pinned
   (:delay 0)
   (:emitter
    (emit-byte segment byte)))
-
-(define-bitfield-emitter emit-header-object 32
-  (byte 24 8) (byte 8 0))
 
 (defun emit-header-data (segment type)
   (emit-back-patch
@@ -1638,13 +1623,13 @@ about function addresses and register values.")
   :pinned
   (:delay 0)
   (:emitter
-   (emit-header-data segment simple-fun-header-widetag)))
+   (emit-header-data segment simple-fun-widetag)))
 
 (define-instruction lra-header-word (segment)
   :pinned
   (:delay 0)
   (:emitter
-   (emit-header-data segment return-pc-header-widetag)))
+   (emit-header-data segment return-pc-widetag)))
 
 
 ;;;; Instructions for converting between code objects, functions, and lras.
@@ -1653,7 +1638,8 @@ about function addresses and register values.")
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
    segment 12 3
-   (lambda (segment posn delta-if-after)
+   (lambda (segment chooser posn delta-if-after)
+       (declare (ignore chooser))
        (let ((delta (funcall calc label posn delta-if-after)))
          (when (<= (- (ash 1 12)) delta (1- (ash 1 12)))
            (emit-back-patch segment 4

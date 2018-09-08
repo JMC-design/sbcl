@@ -1,6 +1,11 @@
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #define LANGUAGE_ASSEMBLY
 
-#include "sbcl.h" 
+#include "sbcl.h"
 #include "lispregs.h"
 #include "globals.h"
 
@@ -58,7 +63,7 @@ x:
 #define store(reg,temp,global) \
 	lis temp,global@ha; stw reg,global@l(temp)
 #endif
-	
+
 #define	FIRST_SAVE_FPR	14	/* lowest-numbered non-volatile FPR */
 #ifdef LISP_FEATURE_DARWIN
 #define	FIRST_SAVE_GPR	13	/* lowest-numbered non-volatile GPR */
@@ -185,8 +190,8 @@ x:
 	mtcr REG(0) @ \
 	lwz REG(0),8(REG(1)) @ \
 	mtlr REG(0) @ \
-	
-#else	
+
+#else
 
 #define C_FULL_PROLOG \
 	mflr 0 ; \
@@ -277,26 +282,12 @@ x:
 	lwz 1,0(1) ; \
 	lwz 0,4(1) ; \
 	mtlr 0 ; \
-	
-#endif
 
-/* gas can't parse nnnnLU; redefine */
-#if BACKEND_PAGE_BYTES == 65536
-# undef BACKEND_PAGE_BYTES
-# define BACKEND_PAGE_BYTES 65536
-#elif BACKEND_PAGE_BYTES == 4096
-# undef BACKEND_PAGE_BYTES
-# define BACKEND_PAGE_BYTES 4096
-#else
-# error BACKEND_PAGE_BYTES mismatch
 #endif
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
-/* OAOOM because we don't have the C headers here. */
-# define THREAD_CSP_PAGE_SIZE 4096
-
 /* the CSP page sits right before the thread */
-# define THREAD_SAVED_CSP_OFFSET (-THREAD_CSP_PAGE_SIZE)
+# define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
 #endif
 
 	.text
@@ -411,11 +402,11 @@ x:
 	addi reg_LIP,reg_CODE,SIMPLE_FUN_CODE_OFFSET
 	mtctr reg_LIP
 	slwi reg_NARGS,reg_NL2,2
-	bctr			
-	
+	bctr
+
 	.align 3
 lra:
-	.long RETURN_PC_HEADER_WIDETAG 
+	.long RETURN_PC_WIDETAG
 
 	/* Blow off any extra values. */
 	mr reg_CSP,reg_OCFP
@@ -455,7 +446,7 @@ lra:
 	subi reg_ALLOC, reg_ALLOC, flag_PseudoAtomic
 	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
 	twnei reg_NL3,0
-	
+
 	/* Back to C */
 	C_FULL_EPILOG
 	blr
@@ -504,7 +495,7 @@ lra:
 	clrrwi reg_NFP,reg_ALLOC,3
 	store(reg_NFP,reg_CFUNC,CSYMBOL(dynamic_space_free_pointer))
 	/* load(reg_CFUNC,current_thread) */
-	
+
 	store(reg_BSP,reg_CFUNC,CSYMBOL(current_binding_stack_pointer))
 	store(reg_CSP,reg_CFUNC,CSYMBOL(current_control_stack_pointer))
 	store(reg_CFP,reg_CFUNC,CSYMBOL(current_control_frame_pointer))
@@ -520,7 +511,12 @@ lra:
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
 	/* OK to run GC without stopping this thread from this point on. */
+#  ifdef LISP_FEATURE_SB_THREAD
 	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
+#  else
+	load(reg_CFUNC,CSYMBOL(all_threads))
+	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_CFUNC)
+#  endif
 #endif
 
 	mr reg_NL3,reg_NARGS
@@ -568,7 +564,12 @@ lra:
 
 # ifdef LISP_FEATURE_SB_SAFEPOINT
 	/* No longer OK to run GC except at safepoints. */
+#  ifdef LISP_FEATURE_SB_THREAD
 	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
+#  else
+	load(reg_BSP,CSYMBOL(all_threads))
+	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_BSP)
+#  endif
 # endif
 
 	/* Atomic ... */
@@ -606,17 +607,18 @@ lra:
 	add reg_LIP,reg_CODE,reg_LIP
 	la reg_LIP,-OTHER_POINTER_LOWTAG(reg_LIP)
 
+        /* Debugger expects LR to be valid when we come out of PA */
+	mtlr reg_LIP
+
 	/* No longer atomic */
 	subi reg_ALLOC, reg_ALLOC, flag_PseudoAtomic
 	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
 	twnei reg_NL3, 0
 
-	mtlr reg_LIP
-	
 	/* Reset the lisp stack. */
 	mr reg_CSP,reg_CFP
 	mr reg_CFP,reg_OCFP
-	
+
 	/* And back into Lisp. */
 	blr
 
@@ -640,7 +642,7 @@ lra:
 	This is header data for a widetag, so shift left eight bits
 	and add. */
         /* FIXME: the above is full of magic numbers. */
-	.long RETURN_PC_HEADER_WIDETAG + 0x600
+	.long RETURN_PC_WIDETAG + 0x600
 
 	/* We are receiving unknown multiple values, thus must deal
 	with the single-value and multiple-value cases separately. */
@@ -653,7 +655,7 @@ lra:
 	obtain a tagged pointer to the enclosing code component.  Both
 	values are tagged OTHER_POINTER_LOWTAG, so we just have to
 	account for the six words (see calculation for
-	RETURN_PC_HEADER_WIDETAG, above) between the two addresses.
+	RETURN_PC_WIDETAG, above) between the two addresses.
 	Restoring reg_CODE doesn't appear to be strictly necessary
 	here, but let's observe the niceties.*/
 	addi reg_CODE, reg_LRA, -24

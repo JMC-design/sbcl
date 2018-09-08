@@ -37,6 +37,13 @@ check_status_maybe_lose "SAVE-LISP-AND-DIE :TOPLEVEL" $? 0 "(saved core ran)"
 # diagnosed and fixed by Dan Barlow in sbcl-0.7.7.29
 run_sbcl <<EOF
   (defun foo (x) (+ x 11))
+  ;; The basic smoke test includes a test that immobile-space defragmentation
+  ;; supports calls to "static" functions - those called without reference
+  ;; to an fdefn, from a caller in dynamic space.
+  ;; dynamic space should be the default for compilation to memory,
+  ;; but maybe someone changed it :immobile, so bind it to be certain.
+  (let (#+immobile-code (sb-c::*compile-to-memory-space* :dynamic))
+     (defvar *afun* (compile nil '(lambda (x) (- (length x))))))
   (save-lisp-and-die "$tmpcore")
 EOF
 run_sbcl_with_core "$tmpcore" --no-userinit --no-sysinit \
@@ -45,6 +52,22 @@ run_sbcl_with_core "$tmpcore" --no-userinit --no-sysinit \
   (exit :code (foo 10))
 EOF
 check_status_maybe_lose "Basic SAVE-LISP-AND-DIE" $? 21 "(saved core ran)"
+
+# Expose potential failure that could happen in save-lisp-and-die in an image
+# that was restarted from one that underwent number coalescing during a
+# previous save-lisp-and-die: A bignum as a layout bitmap can be forwarded
+# while using that bignum as the bitmap to decide what to scan in that selfsame
+# instance. Aside from random failure, this could be detected by enabling
+# 'verify_gens' which printed "Ptr sees free page" after GC failed to scavenge
+# all pointer slots. I believe that it was a coincidence that my test croaked
+# specifically while scanning layout-of-layout. It could have been any
+# structure having a slot holding a bignum EQ to its own layout-bitmap.
+run_sbcl --load ../heap-reloc/embiggen.lisp <<EOF
+  #+gencgc (setf (extern-alien "verify_gens" char) 0)
+  (save-lisp-and-die "$tmpcore")
+EOF
+run_sbcl_with_core "$tmpcore" --no-userinit --no-sysinit --eval "(exit)"
+check_status_maybe_lose "Crash GC" $? 0 "(saved core ran)"
 
 # In sbcl-0.9.8 saving cores with callbacks didn't work on gencgc platforms
 run_sbcl <<EOF
@@ -95,21 +118,50 @@ run_sbcl <<EOF
   (save-lisp-and-die "$tmpcore" :executable t)
 EOF
 chmod u+x "$tmpcore"
-./"$tmpcore" --no-userinit <<EOF
+./"$tmpcore" --no-userinit --no-sysinit <<EOF
   (save-lisp-and-die "$tmpcore" :executable t :save-runtime-options t)
 EOF
 chmod u+x "$tmpcore"
-./"$tmpcore" --no-userinit --version --eval '(exit)' <<EOF
+./"$tmpcore" --no-userinit --no-sysinit --version --eval '(exit)' <<EOF
   (when (equal *posix-argv* '("./$tmpcore" "--version" "--eval" "(exit)"))
     (exit :code 42))
 EOF
 status=$?
+rm "$tmpcore"
 if [ $status != 42 ]; then
     echo "saving runtime options from executable failed"
     exit 1
 fi
 
-rm "$tmpcore"
+# executable core used as "--core" option should not save the memory sizes
+# that were originally saved, but the sizes in the process doing the save.
+run_sbcl_with_args --control-stack-size 160KB --dynamic-space-size 200MB --disable-debugger --no-userinit --no-sysinit --noprint <<EOF
+  (save-lisp-and-die "$tmpcore" :executable t :save-runtime-options t)
+EOF
+chmod u+x "$tmpcore"
+./"$tmpcore" --no-userinit --no-sysinit <<EOF
+  (assert (eql (extern-alien "thread_control_stack_size" unsigned) (* 160 1024)))
+  ; allow slight shrinkage if heap relocation has to adjust for alignment
+  (assert (<= 0 (- (* 200 1048576) (dynamic-space-size)) 65536))
+EOF
+run_sbcl_with_core "$tmpcore" --control-stack-size 200KB --dynamic-space-size 250MB --no-userinit --no-sysinit <<EOF
+  (assert (eql (extern-alien "thread_control_stack_size" unsigned) (* 200 1024)))
+  (assert (eql (dynamic-space-size) (* 250 1048576)))
+  (save-lisp-and-die "${tmpcore}2" :executable t :save-runtime-options t)
+EOF
+chmod u+x "${tmpcore}2"
+./"${tmpcore}2" --no-userinit --no-sysinit <<EOF
+  (when (and (eql (extern-alien "thread_control_stack_size" unsigned) (* 200 1024))
+             (eql (dynamic-space-size) (* 250 1048576)))
+    (exit :code 42))
+EOF
+status=$?
+rm "$tmpcore" "${tmpcore}2"
+if [ $status != 42 ]; then
+    echo "re-saved executable used wrong memory size options"
+    exit 1
+fi
+
 run_sbcl <<EOF
   (save-lisp-and-die "$tmpcore" :toplevel (lambda () 42)
                       :compression (and (member :sb-core-compression *features*) t))

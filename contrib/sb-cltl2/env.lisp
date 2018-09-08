@@ -403,7 +403,7 @@ appear."
          (sb-c::lambda-var
           (setf binding :lexical
                 localp t
-                ignorep (sb-c::lambda-var-ignorep var)))
+                ignorep (sb-c:lambda-var-ignorep var)))
          ;; FIXME: IGNORE doesn't make sense for specials or constants
          ;; -- though it is _possible_ to declare them ignored, but
          ;; we don't keep the information around.
@@ -499,7 +499,7 @@ the condition types that have been muffled."
          (sb-int:awhen (car (rassoc 'muffle-warning handled-conditions))
            (sb-kernel:type-specifier it))))
       (declaration
-       (copy-list sb-c::*recognized-declarations*))
+       (copy-list sb-int:*recognized-declarations*))
       (t (if (info :declaration :handler declaration-name)
              (extra-decl-info
               declaration-name
@@ -532,7 +532,7 @@ is referred to by the expression."
   (let ((env (if environment
                  (sb-c::make-restricted-lexenv environment)
                  (make-null-lexenv))))
-    (compile-in-lexenv nil lambda-expression env)))
+    (compile-in-lexenv lambda-expression env)))
 
 ;;; Add a bit of user-data to a lexenv.
 ;;;
@@ -561,10 +561,17 @@ is referred to by the expression."
             do (push (list* :variable name binding key value) user-data)))
         (:function
          (loop
-            for (name key value) in data
-            for binding1 = (find name pd-fvars :key #'sb-c::leaf-source-name :test #'equal)
-            for binding = (if binding1 binding1 (lexenv-find name funs))
-            do (push (list* :function name binding key value) user-data)))
+           for (name key value) in data
+           for binding = (or (loop for fvar in pd-fvars
+                                   for source-name = (if (consp fvar) ;; MACROLET
+                                                         (car fvar)
+                                                         (sb-c::leaf-source-name fvar))
+                                   when (equal name source-name)
+                                   return (if (consp fvar)
+                                              (cdr fvar)
+                                              fvar))
+                             (lexenv-find name funs))
+           do (push (list* :function name binding key value) user-data)))
         (:declare
          (destructuring-bind (decl-name . value) data
            (push (list* :declare decl-name value) user-data)))))

@@ -14,9 +14,9 @@
 ;;;; LIST and LIST*
 (define-vop (list-or-list*)
   (:args (things :more t))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:scs (non-descriptor-reg)) alloc-temp)
   (:info num)
@@ -73,16 +73,15 @@
 ;;;; Special purpose inline allocators.
 
 (define-vop (allocate-code-object)
-  (:args (boxed-arg :scs (any-reg))
-         (unboxed-arg :scs (any-reg)))
+  ;; BOXED is a count of words as a fixnum; it is therefore also a byte count
+  ;; as a raw value because n-fixnum-tag-bits = word-shift.
+  (:args (boxed :scs (any-reg) :to :save)
+         (unboxed-arg :scs (any-reg) :to :save))
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
-  (:temporary (:scs (any-reg) :from (:argument 0)) boxed)
   (:temporary (:scs (non-descriptor-reg)) size)
   (:temporary (:scs (non-descriptor-reg)) unboxed)
   (:generator 100
-    (inst add boxed boxed-arg (fixnumize (1+ code-constants-offset)))
-    (inst and boxed (lognot lowtag-mask))
     (inst srl unboxed unboxed-arg word-shift)
     (inst add unboxed lowtag-mask)
     (inst and unboxed (lognot lowtag-mask))
@@ -119,7 +118,8 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
@@ -129,7 +129,7 @@
         (allocation result alloc-size fun-pointer-lowtag
                     :stack-p stack-allocate-p
                     :temp-tn temp)
-        (inst li temp (logior (ash (1- size) n-widetag-bits) closure-header-widetag))
+        (inst li temp (logior (ash (1- size) n-widetag-bits) closure-widetag))
         (storew temp result 0 fun-pointer-lowtag)
         (storew function result closure-fun-slot fun-pointer-lowtag)))))
 
@@ -142,7 +142,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 10
     (with-fixed-allocation
-        (result temp value-cell-header-widetag value-cell-size)
+        (result temp value-cell-widetag value-cell-size)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
 ;;;; Automatic allocators for primitive objects.

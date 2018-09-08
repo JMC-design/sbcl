@@ -15,7 +15,6 @@
 
 (load "compiler-test-util.lisp")
 (defpackage "CLOS-IMPURE"
-  (:import-from "SB-KERNEL" "IMPLICIT-GENERIC-FUNCTION-WARNING")
   (:use "CL" "SB-EXT" "ASSERTOID" "TEST-UTIL" "COMPILER-TEST-UTIL"))
 (in-package "CLOS-IMPURE")
 
@@ -23,10 +22,9 @@
 ;;; structure types defined earlier in the file.
 (defstruct struct-a x y)
 (defstruct struct-b x y z)
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod wiggle ((a struct-a))
   (+ (struct-a-x a)
-     (struct-a-y a))))
+     (struct-a-y a)))
 (defgeneric jiggle (arg))
 (defmethod jiggle ((a struct-a))
   (- (struct-a-x a)
@@ -97,58 +95,106 @@
 ;;; DEFGENERIC lambda lists are subject to various limitations, as per
 ;;; section 3.4.2 of the ANSI spec. Since Alexey Dejneka's patch for
 ;;; bug 191-b ca. sbcl-0.7.22, these limitations should be enforced.
-(with-test (:name (defgeneric :lambda-list))
-  (labels ((coerce-to-boolean (x)
-             (if x t nil))
-           (test-case (lambda-list
-                       &optional
-                       expected-failure-p expected-warnings-p message)
-             (declare (type boolean expected-failure-p))
-             #+nil (format t "~&trying ~S~%" lambda-list)
-             (let ((*error-output* (make-string-output-stream) ))
-               (multiple-value-bind (fun warnings-p failure-p)
-                   (compile nil `(lambda () (defgeneric ,(gensym) ,lambda-list)))
-                 (declare (ignore fun))
-                 (assert (eq (coerce-to-boolean failure-p) expected-failure-p))
-                 (assert (eq (coerce-to-boolean warnings-p) expected-warnings-p))
-                 (when message
-                   (assert (search message (get-output-stream-string
-                                            *error-output*))))))))
-    ;; basic sanity
-    (test-case '("a" #p"b")
-               t t "Required argument is not a symbol: \"a\"")
-    (test-case '())
-    (test-case '(x))
-    ;; forbidden default or supplied-p for &OPTIONAL or &KEY arguments
-    (test-case '(x &optional (y 0))
-               t t "invalid &OPTIONAL argument specifier (Y 0)")
-    (test-case '(x &optional y))
-    (test-case '(x y &key (z :z z-p))
-               t t "invalid &KEY argument specifier (Z :Z Z-P)")
-    (test-case '(x y &key z))
-    (test-case '(x &optional (y 0) &key z)
-               t t "invalid &OPTIONAL argument specifier (Y 0)")
-    (test-case '(x &optional y &key z)
-               nil t "&OPTIONAL and &KEY found in the same lambda list")
-    (test-case '(x &optional y &key (z :z))
-               t t "invalid &KEY argument specifier (Z :Z)")
-    (test-case '(x &optional y &key z)
-               nil t "&OPTIONAL and &KEY found in the same lambda list")
-    (test-case '(&optional &key (k :k k-p))
-               t t "invalid &KEY argument specifier (K :K K-P)")
-    (test-case '(&optional &key k))
-    ;; forbidden &AUX
-    (test-case '(x y z &optional a &aux g h)
-               t t "&AUX is not allowed in a generic function lambda list")
-    (test-case '(x y z &optional a))
-    (test-case '(x &aux)
-               t t "&AUX is not allowed in a generic function lambda list")
-    (test-case '(x))
-    ;; also can't use bogoDEFMETHODish type-qualifier-ish decorations
-    ;; on required arguments
-    (test-case '((arg t))
-               t t "Required argument is not a symbol: (ARG T)")
-    (test-case '(arg))))
+(flet ((test-case (operator lambda-list
+                   &optional expect-failure-p expect-warnings-p &rest messages)
+         (multiple-value-bind
+               (fun failure-p warnings style-warnings notes errors)
+             (checked-compile `(lambda () (,operator ,(gensym) ,lambda-list))
+                              :allow-failure expect-failure-p
+                              :allow-warnings expect-warnings-p
+                              :allow-style-warnings expect-warnings-p)
+           (declare (ignore fun notes))
+           (let ((warnings (append style-warnings warnings)))
+             (when expect-failure-p (assert failure-p))
+             (when expect-warnings-p (assert warnings))
+             (assert (= (length messages) (+ (length warnings) (length errors))))
+             (loop for message in messages
+                for error in (append warnings errors)
+                do (assert (search message (princ-to-string error))))))))
+
+  (with-test (:name (defgeneric :lambda-list))
+    (mapc
+     (lambda (spec) (apply #'test-case 'defgeneric spec))
+     '(;; basic sanity
+       (("a" #p"b")
+        t nil "Required argument is not a symbol: \"a\"")
+       (())
+       ((x))
+       ;; repeated names and keywords
+       ((x x)
+        t nil "The variable X occurs more than once")
+       ((x &rest x)
+        t nil "The variable X occurs more than once")
+       ((&optional x x)
+        t nil "The variable X occurs more than once")
+       ((&key x ((:y x)))
+        t nil "The variable X occurs more than once")
+       ((&key x ((:x y)))
+        t nil "The keyword :X occurs more than once")
+       ((&key ((:x a)) ((:x b)))
+        t nil "The keyword :X occurs more than once")
+       ;; illegal variable names
+       ((nil)
+        t nil "NIL cannot be used")
+       ((:pi)
+        t nil ":PI is a keyword and cannot be used")
+       ((pi)
+        t nil "COMMON-LISP:PI names a defined constant")
+       ;; forbidden default or supplied-p for &OPTIONAL or &KEY arguments
+       ((x &optional (y 0))
+        t nil "Invalid &OPTIONAL argument specifier (Y 0)")
+       ((x &optional y))
+       ((x y &key (z :z z-p))
+        t nil "Invalid &KEY argument specifier (Z :Z Z-P)")
+       ((x y &key z))
+       ((x &optional (y 0) &key z)
+        t t
+        "&OPTIONAL and &KEY found in the same lambda list"
+        "Invalid &OPTIONAL argument specifier (Y 0)")
+       ((x &optional y &key z)
+        nil t "&OPTIONAL and &KEY found in the same lambda list")
+       ((x &optional y &key (z :z))
+        t t
+        "&OPTIONAL and &KEY found in the same lambda list"
+        "Invalid &KEY argument specifier (Z :Z)")
+       ((&optional &key (k :k k-p))
+        t nil "Invalid &KEY argument specifier (K :K K-P)")
+       ((&optional &key k))
+       ;; forbidden &AUX
+       ((x y z &optional a &aux g h)
+        t nil "&AUX is not allowed in a generic function lambda list")
+       ((x y z &optional a))
+       ((x &aux)
+        t nil "&AUX is not allowed in a generic function lambda list")
+       ;; also can't use bogoDEFMETHODish type-qualifier-ish decorations
+       ;; on required arguments
+       (((arg t))
+        t nil "Required argument is not a symbol: (ARG T)"))))
+
+  (with-test (:name (defmethod :lambda-list))
+    (mapc
+     (lambda (spec) (apply #'test-case 'defmethod spec))
+     '(;; Invalid specialized required argument
+       (((x t t))
+        t nil "arg is not a non-NIL symbol or a list of two elements: (X T T)")
+       ;; Repeated names and keywords
+       (((x t) (x t))
+        t nil "The variable X occurs more than once")
+       (((x t) &rest x)
+        t nil "The variable X occurs more than once")
+       ((&optional x x)
+        t nil "The variable X occurs more than once")
+       ((&key x ((:y x)))
+        t nil "The variable X occurs more than once")
+       ((&key x ((:x y)))
+        t nil "The keyword :X occurs more than once")
+       ;; Illegal variable names
+       (((nil t))
+        t nil "NIL cannot be used")
+       (((:pi t))
+        t nil ":PI is a keyword and cannot be used")
+       (((pi t))
+        t nil "COMMON-LISP:PI names a defined constant")))))
 
 
 ;;; Explicit :metaclass option with structure-class and
@@ -609,14 +655,13 @@
                           (declare (notinline concatenate)))))
 ;;; CALL-NEXT-METHOD should call NO-NEXT-METHOD if there is no next
 ;;; method.
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
-(defmethod no-next-method-test ((x integer)) (call-next-method)))
-(assert (null (ignore-errors (no-next-method-test 1))))
+(defmethod no-next-method-test ((x integer)) (call-next-method))
+(assert-error (no-next-method-test 1) sb-pcl::no-next-method-error)
 (defmethod no-next-method ((g (eql #'no-next-method-test)) m &rest args)
   (declare (ignore args))
   'success)
 (assert (eq (no-next-method-test 1) 'success))
-(assert (null (ignore-errors (no-next-method-test 'foo))))
+(assert-error (no-next-method-test 'foo) sb-pcl::no-applicable-method-error)
 
 ;;; regression test for bug 176, following a fix that seems
 ;;; simultaneously to fix 140 while not exposing 176 (by Gerd
@@ -796,16 +841,14 @@
 
 ;;; DEFMETHOD should signal an ERROR if an incompatible lambda list is
 ;;; given:
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
-(defmethod incompatible-ll-test-1 (x) x))
+(defmethod incompatible-ll-test-1 (x) x)
 (assert-error (defmethod incompatible-ll-test-1 (x y) y))
 (assert-error (defmethod incompatible-ll-test-1 (x &rest y) y))
 ;;; Sneakily using a bit of MOPness to check some consistency
 (assert (= (length
             (sb-pcl:generic-function-methods #'incompatible-ll-test-1)) 1))
 
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
-(defmethod incompatible-ll-test-2 (x &key bar) bar))
+(defmethod incompatible-ll-test-2 (x &key bar) bar)
 (assert-error (defmethod incompatible-ll-test-2 (x) x))
 (defmethod incompatible-ll-test-2 (x &rest y) y)
 (assert (= (length
@@ -820,8 +863,7 @@
 
 (assert (eq (incompatible-ll-test-2 1 :bar 'yes) 'yes))
 
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
-(defmethod incompatible-ll-test-3 ((x integer)) x))
+(defmethod incompatible-ll-test-3 ((x integer)) x)
 (remove-method #'incompatible-ll-test-3
                (find-method #'incompatible-ll-test-3
                             nil
@@ -850,9 +892,8 @@
 
 ;;; bug #136: CALL-NEXT-METHOD was being a little too lexical,
 ;;; resulting in failure in the following:
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod call-next-method-lexical-args ((x integer))
-  x))
+  x)
 (defmethod call-next-method-lexical-args :around ((x integer))
   (let ((x (1+ x)))
     (declare (ignorable x))
@@ -1016,8 +1057,7 @@
 
 ;;; we should be able to specialize on anything that names a class.
 (defclass name-for-class () ())
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
-(defmethod something-that-specializes ((x name-for-class)) 1))
+(defmethod something-that-specializes ((x name-for-class)) 1)
 (setf (find-class 'other-name-for-class) (find-class 'name-for-class))
 (defmethod something-that-specializes ((x other-name-for-class)) 2)
 (assert (= (something-that-specializes (make-instance 'name-for-class)) 2))
@@ -1082,6 +1122,41 @@
   (:method ((x integer)) (setq x 3)
            (list x (call-next-method) (call-next-method x))))
 (assert (equal (cnm-assignment 1) '(3 1 3)))
+
+;;; lp#1734771: Even for assignment to parameters (implcitly or
+;;; explicitly) specialized to T, or using EQL specializers.
+(defgeneric bug-1734771 (x y)
+  (:method (x y) (list x y))
+  (:method ((x integer) y)
+    (incf y)
+    (call-next-method))
+  (:method ((x symbol) (y t))
+    (incf y)
+    (call-next-method))
+  (:method (x (y (eql nil)))
+    (setf y t)
+    (call-next-method)))
+(with-test (:name (:cnm-assignment :bug-1734771 1))
+  (assert (equal (bug-1734771 2 3) '(2 3))))
+(with-test (:name (:cnm-assignment :bug-1734771 2))
+  (assert (equal (bug-1734771 t 3) '(t 3))))
+(with-test (:name (:cnm-assignment :bug-1734771 3))
+  (assert (equal (bug-1734771 #\c nil) '(#\c nil))))
+
+(defgeneric bug-1734771-2 (x &optional y)
+  (:method (x &optional (y nil y-p)) (list x y y-p))
+  (:method ((x integer) &optional (y 0))
+    (incf y)
+    (call-next-method))
+  (:method ((x symbol) &optional (y 0))
+    (declare (ignore y))
+    (call-next-method)))
+(with-test (:name (:cnm-assignment :bug-1734771 4))
+  (assert (equal (bug-1734771-2 2) '(2 nil nil))))
+(with-test (:name (:cnm-assignment :bug-1734771 5))
+  (assert (equal (bug-1734771-2 2 0) '(2 0 t))))
+(with-test (:name (:cnm-assignment :bug-1734771 6))
+  (assert (equal (bug-1734771-2 t) '(t nil nil))))
 
 ;;; Bug reported by Istvan Marko 2003-07-09
 (let ((class-name (gentemp)))
@@ -1093,7 +1168,7 @@
         finally (eval `(defclass ,class-name ()
                          (,@slot-descs)
                          (:default-initargs ,@default-initargs))))
-  (let ((f (compile nil `(lambda () (make-instance ',class-name)))))
+  (let ((f (checked-compile `(lambda () (make-instance ',class-name)))))
     (assert (typep (funcall f) class-name))))
 
 ;;; bug 262: DEFMETHOD failed on a generic function without a lambda
@@ -1105,28 +1180,26 @@
 
 ;;; salex on #lisp 2003-10-13 reported that type declarations inside
 ;;; WITH-SLOTS are too hairy to be checked
-(defun ensure-no-notes (form)
-  (handler-case (compile nil `(lambda () ,form))
-    (sb-ext:compiler-note (c)
-      ;; FIXME: it would be better to check specifically for the "type
-      ;; is too hairy" note
-      (error c))))
 (defvar *x*)
-(ensure-no-notes '(with-slots (a) *x*
-                   (declare (integer a))
-                   a))
-(ensure-no-notes '(with-slots (a) *x*
-                   (declare (integer a))
-                   (declare (notinline slot-value))
-                   a))
+(with-test (:name (with-slots declare :note :hairy))
+  (flet ((ensure-no-notes (form)
+           ;; FIXME: it would be better to check specifically for the "type
+           ;; is too hairy" note
+           (checked-compile `(lambda () ,form) :allow-notes nil)))
+    (ensure-no-notes '(with-slots (a) *x*
+                       (declare (integer a))
+                       a))
+    (ensure-no-notes '(with-slots (a) *x*
+                       (declare (integer a))
+                       (declare (notinline slot-value))
+                       a))))
 
 ;;; from CLHS 7.6.5.1
 (defclass character-class () ((char :initarg :char)))
 (defclass picture-class () ((glyph :initarg :glyph)))
 (defclass character-picture-class (character-class picture-class) ())
 
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
-(defmethod width ((c character-class) &key font) font))
+(defmethod width ((c character-class) &key font) font)
 (defmethod width ((p picture-class) &key pixel-size) pixel-size)
 
 (assert-error
@@ -1141,6 +1214,54 @@
                    :font 'baskerville :pixel-size 10)
             'baskerville))
 
+;;; consequences of 7.6.5.1 on EQL-specialized effective methods
+;;; (reported by Syll, lp#1760987)
+(defgeneric eqls1760987 (x &key k1))
+(defmethod eqls1760987 ((x (eql 1)) &key k1 k2)
+  (list x k1 k2))
+(defmethod eqls1760987 ((x (eql 2)) &key k1 k3)
+  (list x k1 k3))
+(defmethod eqls1760987 ((x integer) &key k1 k4)
+  (list x k1 k4))
+
+(with-test (:name :bug-1760987)
+  (assert (equal (eqls1760987 1) '(1 nil nil)))
+  (assert (equal (eqls1760987 1 :k1 2) '(1 2 nil)))
+  (assert (equal (eqls1760987 1 :k2 2) '(1 nil 2)))
+  (assert (equal (eqls1760987 1 :k1 2 :k2 3) '(1 2 3)))
+  (assert (equal (eqls1760987 1 :k4 4) '(1 nil nil)))
+  (assert (equal (eqls1760987 1 :k1 2 :k4 4) '(1 2 nil)))
+  (assert (equal (eqls1760987 1 :k2 2 :k4 4) '(1 nil 2)))
+  (assert (equal (eqls1760987 1 :k1 2 :k2 3 :k4 4) '(1 2 3)))
+  (assert (equal (eqls1760987 2) '(2 nil nil)))
+  (assert (equal (eqls1760987 2 :k1 2) '(2 2 nil)))
+  (assert (equal (eqls1760987 2 :k3 2) '(2 nil 2)))
+  (assert (equal (eqls1760987 2 :k1 2 :k3 3) '(2 2 3)))
+  (assert (equal (eqls1760987 2 :k4 4) '(2 nil nil)))
+  (assert (equal (eqls1760987 2 :k1 2 :k4 4) '(2 2 nil)))
+  (assert (equal (eqls1760987 2 :k3 2 :k4 4) '(2 nil 2)))
+  (assert (equal (eqls1760987 2 :k1 2 :k3 3 :k4 4) '(2 2 3)))
+  (assert (equal (eqls1760987 3) '(3 nil nil)))
+  (assert (equal (eqls1760987 3 :k1 2) '(3 2 nil)))
+  (assert (equal (eqls1760987 3 :k4 2) '(3 nil 2)))
+  (assert (equal (eqls1760987 3 :k1 2 :k4 3) '(3 2 3)))
+  (assert-error (eqls1760987 1 :k3 5) program-error)
+  (assert-error (eqls1760987 1 :k1 2 :k3 5) program-error)
+  (assert-error (eqls1760987 1 :k2 2 :k3 5) program-error)
+  (assert-error (eqls1760987 1 :k1 2 :k2 3 :k3 5) program-error)
+  (assert-error (eqls1760987 2 :k2 5) program-error)
+  (assert-error (eqls1760987 2 :k1 2 :k2 5) program-error)
+  (assert-error (eqls1760987 2 :k3 2 :k2 5) program-error)
+  (assert-error (eqls1760987 2 :k1 2 :k3 3 :k2 5) program-error)
+  (assert-error (eqls1760987 3 :k3 5) program-error)
+  (assert-error (eqls1760987 3 :k1 2 :k3 5) program-error)
+  (assert-error (eqls1760987 3 :k4 2 :k3 5) program-error)
+  (assert-error (eqls1760987 3 :k1 2 :k2 3 :k3 5) program-error)
+  (assert-error (eqls1760987 3 :k2 5) program-error)
+  (assert-error (eqls1760987 3 :k1 2 :k2 5) program-error)
+  (assert-error (eqls1760987 3 :k4 2 :k2 5) program-error)
+  (assert-error (eqls1760987 3 :k1 2 :k3 3 :k2 5) program-error)
+  )
 ;;; class redefinition shouldn't give any warnings, in the usual case
 (defclass about-to-be-redefined () ((some-slot :accessor some-slot)))
 (handler-bind ((warning #'error))
@@ -1282,51 +1403,43 @@
   (assert (equal (aref v 1) '(t 1 2))))
 
 ;;; BUG 276: declarations and mutation.
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod fee ((x fixnum))
   (setq x (/ x 2))
-  x))
+  x)
 (assert (= (fee 1) 1/2))
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod fum ((x fixnum))
   (setf x (/ x 2))
-  x))
+  x)
 (assert (= (fum 3) 3/2))
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod fii ((x fixnum))
   (declare (special x))
   (setf x (/ x 2))
-  x))
+  x)
 (assert (= (fii 1) 1/2))
 (defvar *faa*)
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod faa ((*faa* string-stream))
   (setq *faa* (make-broadcast-stream *faa*))
   (write-line "Break, you sucker!" *faa*)
-  'ok))
+  'ok)
 (assert (eq 'ok (faa (make-string-output-stream))))
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod fex ((x fixnum) (y fixnum))
   (multiple-value-setq (x y) (values (/ x y) (/ y x)))
-  (list x y)))
+  (list x y))
 (assert (equal (fex 5 3) '(5/3 3/5)))
 
 ;;; Bug reported by Zach Beane; incorrect return of (function
 ;;; ',fun-name) in defgeneric
-(assert
- (typep (funcall (compile nil
-                          '(lambda () (flet ((nonsense () nil))
-                                        (declare (ignorable #'nonsense))
-                                        (defgeneric nonsense ())))))
-        'generic-function))
-
-(assert
- (typep (funcall (compile nil
-                          '(lambda () (flet ((nonsense-2 () nil))
-                                        (declare (ignorable #'nonsense-2))
-                                        (defgeneric nonsense-2 ()
-                                          (:method () t))))))
-        'generic-function))
+(with-test (:name (defgeneric :return type))
+  (flet ((test (form)
+           (let ((fun (checked-compile form)))
+             (assert (typep (funcall fun) 'generic-function)))))
+    (test '(lambda () (flet ((nonsense () nil))
+                        (declare (ignorable #'nonsense))
+                        (defgeneric nonsense ()))))
+    (test '(lambda () (flet ((nonsense-2 () nil))
+                        (declare (ignorable #'nonsense-2))
+                        (defgeneric nonsense-2 ()
+                          (:method () t)))))))
 
 ;;; bug reported by Bruno Haible: (setf find-class) using a
 ;;; forward-referenced class
@@ -1393,7 +1506,7 @@
 (load "package-ctor-bug.lisp")
 (assert (= (package-ctor-bug:test) 3))
 
-(with-test (:name (:defmethod (setf find-class) integer))
+(with-test (:name (defmethod (setf find-class) integer))
   (handler-bind ((warning #'muffle-warning))
   (mapcar #'eval
           '(
@@ -1618,14 +1731,12 @@
 ;;; Using class instances as specializers, reported by Pascal Costanza, ref CLHS 7.6.2
 (defclass class-as-specializer-test ()
    ())
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (eval `(defmethod class-as-specializer-test1 ((x ,(find-class 'class-as-specializer-test)))
-          'foo)))
+         'foo))
 (assert (eq 'foo (class-as-specializer-test1 (make-instance 'class-as-specializer-test))))
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
-(funcall (compile nil `(lambda ()
-                         (defmethod class-as-specializer-test2 ((x ,(find-class 'class-as-specializer-test)))
-                           'bar)))))
+(funcall (checked-compile `(lambda ()
+                             (defmethod class-as-specializer-test2 ((x ,(find-class 'class-as-specializer-test)))
+                               'bar))))
 (assert (eq 'bar (class-as-specializer-test2 (make-instance 'class-as-specializer-test))))
 
 ;;; CHANGE-CLASS and tricky allocation.
@@ -1703,7 +1814,7 @@
   (:method :ignore ((x number)) (declare (notinline /)) (/ 0)))
 (handler-bind ((style-warning #'muffle-warning))
 (assert (equal '(result) (test-mc27prime 3))))
-(assert-error (test-mc27 t))           ; still no-applicable-method
+(assert-error (test-mc27 t) sb-pcl::no-applicable-method-error) ; still no-applicable-method
 
 ;;; more invalid wrappers.  This time for a long-standing bug in the
 ;;; compiler's expansion for TYPEP on various class-like things, with
@@ -1723,12 +1834,11 @@
 (defclass listoid ()
   ((caroid :initarg :caroid)
    (cdroid :initarg :cdroid :initform nil)))
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod lengthoid ((x listoid))
   (let ((result 0))
     (loop until (null x)
           do (incf result) (setq x (slot-value x 'cdroid)))
-    result)))
+    result))
 (with-test (:name ((:setq :method-parameter) slot-value))
   (assert (= (lengthoid (make-instance 'listoid)) 1))
   (assert (= (lengthoid
@@ -1750,12 +1860,11 @@
   `(progn
      (fmakunbound 'll-method)
      (fmakunbound 'll-function)
-     (handler-bind ((implicit-generic-function-warning #'muffle-warning))
      (defmethod ll-method ,lambda-list
        ,@declarations
        ,@(when cnm
            `((when nil (call-next-method))))
-       (list ,@values)))
+       (list ,@values))
      (defun ll-function ,lambda-list
        ,@declarations
        (list ,@values))
@@ -1853,9 +1962,8 @@
 
 (test (&key a b &allow-other-keys) (a b) (:a 1 :b 2 :c 3))
 
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod clim-style-lambda-list-test (a b &optional c d &key x y)
-  (list a b c d x y)))
+  (list a b c d x y))
 
 (clim-style-lambda-list-test 1 2)
 
@@ -1976,11 +2084,10 @@
 (defclass fah ()
   ((x :initform :fah)))
 (declaim (special *fih*))
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod fihfah ((*fih* fih))
   (set '*fih* (make-instance 'fah))
   (list (slot-value *fih* 'x)
-        (eval '(slot-value *fih* 'x)))))
+        (eval '(slot-value *fih* 'x))))
 (defmethod fihfah ((fah fah))
   (declare (special fah))
   (set 'fah (make-instance 'fih))
@@ -1990,11 +2097,10 @@
   (assert (equal '(:fah :fah) (fihfah (make-instance 'fih))))
   (assert (equal '(:fih :fih) (fihfah (make-instance 'fah)))))
 
-(handler-bind ((implicit-generic-function-warning #'muffle-warning))
 (defmethod no-implicit-declarations-for-local-specials ((faax double-float))
   (declare (special faax))
   (set 'faax (when (< faax 0) (- faax)))
-  faax))
+  faax)
 (with-test (:name :no-implicit-declarations-for-local-specials)
   (assert (not (no-implicit-declarations-for-local-specials 1.0d0))))
 
@@ -2046,12 +2152,12 @@
                 i-dont-want-to-be-clobbered-1
                 i-dont-want-to-be-clobbered-2))
 (handler-bind ((warning #'muffle-warning))
-(defgeneric i-dont-want-to-be-clobbered-1 (t t t))
+(defgeneric i-dont-want-to-be-clobbered-1 (x y z))
 (defmethod i-dont-want-to-be-clobbered-2 ((x cons) y z)
   y))
 (defun i-cause-an-gf-info-update ()
   (i-dont-want-to-be-clobbered-2 t t t))
-(with-test (:name :defgeneric-should-clobber-ftype)
+(with-test (:name (defgeneric :should-clobber-ftype))
   ;; (because it doesn't check the argument or result types)
   (assert (equal '(function (t t t) *)
                  (sb-kernel:type-specifier
@@ -2097,12 +2203,11 @@
 (with-test (:name :bug-485019)
   ;; there was a bug in WALK-SETQ, used in method body walking, in the
   ;; presence of declarations on symbol macros.
-  (handler-bind ((implicit-generic-function-warning #'muffle-warning))
   (defmethod bug-485019 ((bug-485019 bug-485019))
     (with-slots (array) bug-485019
       (declare (type (or null simple-array) array))
       (setf array (make-array 4)))
-    bug-485019))
+    bug-485019)
   (funcall 'bug-485019 (make-instance 'bug-485019)))
 
 ;;; The compiler didn't propagate the declarared type before applying
@@ -2128,7 +2233,7 @@
   "string")
 (with-test (:name :no-applicable-method/retry)
   (assert (equal "cons"
-                 (handler-bind ((error
+                 (handler-bind ((sb-pcl::no-applicable-method-error
                                  (lambda (c)
                                    (declare (ignore c))
                                    (let ((r (find-restart 'sb-pcl::retry)))
@@ -2142,7 +2247,7 @@
 (defmethod no-primary-method/retry :before (x) (assert x))
 (with-test (:name :no-primary-method/retry)
   (assert (equal "ok!"
-                 (handler-bind ((error
+                 (handler-bind ((sb-pcl::no-primary-method-error
                                  (lambda (c)
                                    (declare (ignore c))
                                    (let ((r (find-restart 'sb-pcl::retry)))
@@ -2197,9 +2302,8 @@
 (with-test (:name (defmethod :specializer-builtin-class-alias :bug-618387))
   (let ((alias (gensym)))
     (setf (find-class alias) (find-class 'symbol))
-    (handler-bind ((implicit-generic-function-warning #'muffle-warning))
     (eval `(defmethod lp-618387 ((s ,alias))
-             (symbol-name s))))
+             (symbol-name s)))
     (assert (equal "FOO" (funcall 'lp-618387 :foo)))))
 
 (with-test (:name (defmethod :pcl-spurious-ignore-warnings))
@@ -2262,9 +2366,9 @@
           ((,pax :type (or null ,pax))))
         (defclass ,sup ()
           ())
-        (handler-bind ((implicit-generic-function-warning #'muffle-warning))
         (defmethod ,frob ((pnr ,pnr))
-          (slot-value pnr ',pax)))))))
+          (slot-value pnr ',pax))
+        (declaim (optimize (safety 1) (debug 1)))))))
 
 (defclass bug-1099708 () ((slot-1099708 :initarg :slot-1099708)))
 (defun make-1099708-1 ()
@@ -2320,6 +2424,7 @@
 
 (defclass bug-1099708b-pathname ()
   ((slot-1099708b-pathname :initarg :slot-1099708b-pathname)))
+#+nil ; after change 58602640ed, I don't see how to make this assert something useful
 (with-test (:name :bug-1099708b-pathname)
   (defun make-1099708b-pathname-1 ()
     (make-instance 'bug-1099708b-pathname :slot-1099708b-pathname #p"pn"))
@@ -2362,7 +2467,9 @@
   ;; Now compile a lambda containing MAKE-INSTANCE to exercise the
   ;; fallback constructor generator. Call the resulting compiled
   ;; function to trigger the bug.
-  (funcall (compile nil '(lambda () (make-instance 'bug-1179858 :foo t)))))
+  (checked-compile-and-assert ()
+      '(lambda () (make-instance 'bug-1179858 :foo t))
+    (() nil :test (constantly t))))
 
 ;;; Other brokenness, found while investigating: fallback-generator
 ;;; handling of non-keyword initialization arguments
@@ -2375,9 +2482,9 @@
 (with-test (:name (make-instance :fallback-generator-non-keyword-initarg :bug-1179858))
   (flet ((foo= (n i) (= (bug-1179858b-foo i) n)))
     (assert
-     (foo= 14 (funcall (compile nil '(lambda () (make-instance 'bug-1179858b))))))
+     (foo= 14 (funcall (checked-compile '(lambda () (make-instance 'bug-1179858b))))))
     (assert
-     (foo= 15 (funcall (compile nil '(lambda () (make-instance 'bug-1179858b 'foo 15))))))))
+     (foo= 15 (funcall (checked-compile '(lambda () (make-instance 'bug-1179858b 'foo 15))))))))
 
 (with-test (:name (:cpl-violation-setup :bug-309076))
   (assert-error
@@ -2393,23 +2500,18 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require 'sb-cltl2)
-  (handler-bind ((implicit-generic-function-warning #'muffle-warning))
-  (defmethod b ())))
+  (defmethod b ()))
 
 (defmacro macro ()
   (let ((a 20))
     (declare (special a))
-    (assert
-     (=
-      (funcall
-       (compile nil
-                (sb-mop:make-method-lambda
-                 #'b
-                 (find-method #'b () ())
-                 '(lambda () (declare (special a)) a)
-                 nil))
-       '(1) ())
-      20))))
+    (checked-compile-and-assert ()
+        (sb-mop:make-method-lambda
+         #'b
+         (find-method #'b () ())
+         '(lambda () (declare (special a)) a)
+         nil)
+      (('(1) ()) 20))))
 
 (with-test (:name :make-method-lambda-leakage)
   ;; lambda list of X leaks into the invocation of make-method-lambda
@@ -2419,15 +2521,9 @@
 
 (with-test (:name (defmethod :undefined-function :bug-503095))
   (flet ((test-load (file)
-           (let (implicit-gf-warning)
-             (handler-bind
-                 ((sb-ext:implicit-generic-function-warning
-                    (lambda (x)
-                      (setf implicit-gf-warning x)
-                      (muffle-warning x)))
-                  ((or warning error) #'error))
-               (load file))
-             (assert implicit-gf-warning))))
+           (handler-bind
+               (((or warning error) #'error))
+             (load file))))
     (multiple-value-bind (fasl warnings errorsp)
           (compile-file "bug-503095.lisp" :print nil :verbose nil)
       (unwind-protect
@@ -2493,7 +2589,7 @@
    (defclass class-with-superclass-cycle2 (class-with-superclass-cycle1) ())))
 
 (with-test (:name (sb-mop:ensure-class :self-metaclass))
-  ;; These have a superclass cycle from the beginning.
+  ;; These have a metaclass cycle from the beginning.
   (assert-error
    (defclass class-with-self-as-metaclass () ()
      (:metaclass class-with-self-as-metaclass))))
@@ -2517,7 +2613,7 @@
    (defclass class-with-eventual-superclass-cycle1
        (class-with-eventual-superclass-cycle2) ())))
 
-(with-test (:name (sb-pcl::update-class :becomses-own-metaclass))
+(with-test (:name (sb-pcl::update-class :becomes-self-metaclass))
   (defclass class-with-eventual-self-as-metaclass () ())
   ;; Try to update metaclass to self.
   (assert-error
@@ -2540,9 +2636,31 @@
       (sb-mop:finalize-inheritance (find-class class1))
       (assert (not (sb-kernel:layout-invalid (sb-kernel:layout-of instance)))))))
 
-(with-test (:name :allocate-instance-on-symbol)
+(with-test (:name (allocate-instance :on symbol))
   (let ((class (gensym "CLASS-")))
     (eval `(defclass ,class () ()))
-    (assert-error
-     (funcall (checked-compile `(lambda ()
-                                  (allocate-instance ',class)))))))
+    (checked-compile-and-assert ()
+        `(lambda () (allocate-instance ',class))
+      (() (condition 'sb-pcl::no-applicable-method-error)))))
+
+(defclass unbound-slot-after-allocation=class ()
+  ((abc :allocation :class)
+   (d :accessor unbound-slot-after-allocation=class)))
+
+(with-test (:name :unbound-slot-after-allocation=class)
+  (assert-error (unbound-slot-after-allocation=class
+                 (make-instance 'unbound-slot-after-allocation=class))
+                unbound-slot))
+
+(with-test (:name :layouf-of-nil)
+  (assert (eq (sb-kernel:layout-of nil) (sb-kernel:find-layout 'null))))
+
+(with-test (:name (defmethod :on-classless-type))
+  (handler-bind ((timeout (lambda (condition)
+                            (declare (ignore condition))
+                            (error "Timeout"))))
+    (sb-ext:with-timeout 10
+      (checked-compile-and-assert (:allow-warnings t)
+          `(lambda ()
+             (defmethod foo ((bar keyword))))
+        (() (condition 'sb-pcl:class-not-found-error))))))

@@ -32,12 +32,24 @@
     ((or numeric-type
          named-type
          member-type
-         array-type
          character-set-type
          built-in-classoid
-         cons-type
          #!+sb-simd-pack simd-pack-type)
-     (values (%%typep obj type) t))
+     (values (%%typep obj type)
+             t))
+    (array-type
+     (if (contains-unknown-type-p type)
+         (values nil (not (arrayp obj)))
+         (values (%%typep obj type) t)))
+    (cons-type
+     ;; Do not use %%TYPEP because of SATISFIES
+     (if (consp obj)
+         (multiple-value-bind (typep valid)
+             (ctypep (car obj) (cons-type-car-type type))
+           (if typep
+               (ctypep (cdr obj) (cons-type-cdr-type type))
+               (values nil valid)))
+         (values nil t)))
     (classoid
      (if (if (csubtypep type (specifier-type 'function))
              (funcallable-instance-p obj)
@@ -54,6 +66,8 @@
               #'ctypep
               obj
               (compound-type-types type)))
+    (fun-designator-type
+     (values (typep obj '(or function symbol)) t))
     (fun-type
      (values (functionp obj) t))
     (unknown-type
@@ -204,7 +218,6 @@
 ;;;; which are not needed during self-build.
 
 (defun typexpand-all (type-specifier &optional env)
-  #!+sb-doc
   "Takes and expands a type specifier recursively like MACROEXPAND-ALL."
   ;; TYPE-SPECIFIER is of type TYPE-SPECIFIER, but it is preferable to
   ;; defer to VALUES-SPECIFIER-TYPE for the check.
@@ -222,14 +235,12 @@
   (type-specifier (values-specifier-type type-specifier)))
 
 (defun defined-type-name-p (name &optional env)
-  #!+sb-doc
   "Returns T if NAME is known to name a type specifier, otherwise NIL."
   (declare (symbol name))
   (declare (ignore env))
   (and (info :type :kind name) t))
 
 (defun valid-type-specifier-p (type-specifier &optional env)
-  #!+sb-doc
   "Returns T if TYPE-SPECIFIER is a valid type specifier, otherwise NIL.
 
 There may be different metrics on what constitutes a \"valid type
@@ -263,3 +274,45 @@ Experimental."
   ;; just deem it invalid.
   (not (null (ignore-errors
                (type-or-nil-if-unknown type-specifier t)))))
+
+;;; Parse the log file from CROSS-TYPEP and check that its values
+;;; agree with the target type system.
+;;; To be used after build of the system.
+(defun verify-cross-typep ()
+  (let ((ct/rt-mismatch-typespecs nil)
+        (linenum))
+    (dotimes (i 3)
+      (with-open-file (f (format nil "output/cross-typep-~D.log" (1+ i)))
+        (setq linenum 0)
+        (loop
+         (let ((line (read-line f nil nil)))
+           (unless line (return))
+           (incf linenum)
+           (unless (or (search "BEFORE-XC-TESTS" line)
+                       (search "SB-COLD" line)
+                       (search "SB!INT:!DEFINE-LOAD-TIME-GLOBAL" line)
+                       (search "*!INITIAL-LAYOUTS*" line)
+                       (search "*!INITIAL-SYMBOLS*" line)
+                       (search "*!INITIAL-ASSEMBLER-ROUTINES*" line)
+                       (search "*!LOAD-TIME-VALUES*" line)
+                       (search "(SB!FASL:*!COLD-" line)
+                       (search "#S(SB!C::RESTART-LOCATION" line))
+             (let ((form (read-from-string line)))
+               (destructuring-bind (obj typespec xc-winp xc-certainp) form
+                 (binding* (((winp certainp)
+                             (ctypep obj (values-specifier-type typespec)))
+                            (typep-answer
+                             (%%typep obj (values-specifier-type typespec) nil)))
+                   (unless (eq winp typep-answer)
+                     (unless (member typespec ct/rt-mismatch-typespecs
+                                     :test 'equal)
+                       (push typespec ct/rt-mismatch-typespecs)
+                       (format t "COMPILER/RUNTIME DISAGREE: ~S -> ~S ~S ~S~%"
+                               form winp certainp typep-answer)))
+                   (unless xc-certainp
+                     (format t "XC UNCERTAIN: ~S~%" form))
+                   ;; This is not always right because I don't record
+                   ;; which mode CROSS-TYPEP was invoked in.
+                   (unless (eq xc-winp winp)
+                     (format t "WRONG ANSWER: ~S~%SHOULD BE: ~S~%"
+                             form winp))))))))))))

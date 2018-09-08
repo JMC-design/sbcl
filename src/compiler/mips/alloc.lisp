@@ -14,9 +14,9 @@
 ;;;; LIST and LIST*
 (define-vop (list-or-list*)
   (:args (things :more t))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
   (:info num)
@@ -133,17 +133,16 @@
       (align-csp temp))))
 
 (define-vop (allocate-code-object)
-  (:args (boxed-arg :scs (any-reg))
-         (unboxed-arg :scs (any-reg)))
+  ;; BOXED is a count of words as a fixnum; it is therefore also a byte count
+  ;; as a raw value because n-fixnum-tag-bits = word-shift.
+  (:args (boxed :scs (any-reg) :to :save)
+         (unboxed-arg :scs (any-reg) :to :save))
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
-  (:temporary (:scs (any-reg) :from (:argument 0)) boxed)
   (:temporary (:scs (non-descriptor-reg)) unboxed)
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
   (:generator 100
     (inst li ndescr (lognot lowtag-mask))
-    (inst addu boxed boxed-arg (fixnumize (1+ code-constants-offset)))
-    (inst and boxed ndescr)
     (inst srl unboxed unboxed-arg word-shift)
     (inst addu unboxed unboxed lowtag-mask)
     (inst and unboxed ndescr)
@@ -174,7 +173,8 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
   (:results (result :scs (descriptor-reg)))
@@ -191,7 +191,7 @@
         (inst sll result n-lowtag-bits)
         (inst or result fun-pointer-lowtag)
         (inst li temp (logior (ash (1- size) n-widetag-bits)
-                              closure-header-widetag))
+                              closure-widetag))
         (storew temp result 0 fun-pointer-lowtag)
         (storew function result closure-fun-slot fun-pointer-lowtag)))))
 
@@ -203,7 +203,7 @@
   (:info stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
-    (with-fixed-allocation (result pa-flag temp value-cell-header-widetag
+    (with-fixed-allocation (result pa-flag temp value-cell-widetag
                             value-cell-size stack-allocate-p)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 

@@ -30,8 +30,8 @@
   (:note "SAP to pointer coercion")
   (:node-var node)
   (:generator 20
-    (with-fixed-allocation (res sap-widetag sap-size node)
-      (storew sap res sap-pointer-slot other-pointer-lowtag))))
+    (fixed-alloc res sap-widetag sap-size node)
+    (storew sap res sap-pointer-slot other-pointer-lowtag)))
 (define-move-vop move-from-sap :move
   (sap-reg) (descriptor-reg))
 
@@ -43,8 +43,6 @@
   (:results (y :scs (sap-reg)
                :load-if (not (location= x y))))
   (:note "SAP move")
-  (:effects)
-  (:affected)
   (:generator 0
     (move y x)))
 (define-move-vop sap-move :move
@@ -118,7 +116,7 @@
                 (not (location= ptr res)))
            (sc-case offset
              (signed-reg
-              (inst lea res (make-ea :dword :base ptr :index offset :scale 1)))
+              (inst lea res (make-ea :dword :base ptr :index offset)))
              (immediate
               (inst lea res (make-ea :dword :base ptr
                                      :disp (tn-value offset))))))

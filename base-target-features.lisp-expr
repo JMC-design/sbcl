@@ -70,13 +70,6 @@
  ;; the executable I'm running.
  :sb-doc
 
- ;; Do regression and other tests when building the system. You might
- ;; or might not want this if you're not a developer, depending on how
- ;; paranoid you are. You probably do want it if you are a developer.
- ;; This test does not affect the target system (in much the same way
- ;; as :sb-after-xc-core, below).
- :sb-test
-
  ;; Make more debugging information available (for debugging SBCL
  ;; itself). If you aren't hacking or troubleshooting SBCL itself,
  ;; you probably don't want this set.
@@ -102,10 +95,10 @@
  ;; readtable configured so that the system sources can be read.
  ; :sb-show
 
- ;; Build SBCL with the old CMU CL low level debugger, "ldb". In the
- ;; ideal world you would not need this unless you are messing with
- ;; SBCL at a very low level (e.g., trying to diagnose GC problems, or
- ;; trying to debug assembly code for a port to a new CPU). However,
+ ;; Enable the low level debugger, "ldb", by default. In the ideal
+ ;; world you would not need this unless you are messing with SBCL at
+ ;; a very low level (e.g., trying to diagnose GC problems, or trying
+ ;; to debug assembly code for a port to a new CPU). However,
  ;; experience shows that sooner or later everyone lose()'s, in which
  ;; case SB-LDB can at least provide an informative backtrace.
  :sb-ldb
@@ -165,6 +158,13 @@
  ;; instead?
  ;;
  ; :cycle-counter
+
+ ;; Allow the main dynamic space to be allocated anywhere
+ ;; by the OS kernel regardless of the configuration-time value
+ ;; of dynamic-space-start.
+ ;; The downside is the potential need for startup-time relocation.
+ ;; Enabled by default if supported
+ ; :relocatable-heap
 
  ;; Build with support for an additional dynamic heap
  ;; differing from the main dynamic heap in two ways:
@@ -231,10 +231,6 @@
  ;;    sorted in emission order. It could actually perform arbitrary
  ;;    modifications to the vector, e.g. to fuse constants of different
  ;;    size.
- ;; * emit-constant-segment-header: receives the vector of sorted constants
- ;;    and a flag (true iff speed > space). Expected to emit padding
- ;;    of some sort between the ELSEWHERE segment and the constants, or some
- ;;    metadata.
  ;; * emit-inline-constant: receives a constant descriptor and its associated
  ;;    label. Emits the constant.
  ;;
@@ -314,11 +310,6 @@
  ;; believe our API is worth copying to other implementations as well.
  ;; This doesn't affect the build at all, merely declares how things are.
  :package-local-nicknames
-
- ;; This affects the definition of a lot of things in bignum.lisp. It
- ;; doesn't seem to be documented anywhere what systems it might apply
- ;; to. It doesn't seem to be needed for X86 systems anyway.
- ; :32x16-divide
 
  ;; This is set in classic CMU CL, and presumably there it means
  ;; that the floating point arithmetic implementation
@@ -501,8 +492,6 @@
  ;;   :sunos      = We're intended to run under Solaris user environment
  ;;                 with the SunOS kernel.
  ;;   :hpux       = We're intended to run under HP-UX 11.11 or later
- ;;   :osf1       = We're intended to run under Tru64 (aka Digital Unix
- ;;                 aka OSF/1).
  ;;   :win32      = We're intended to under some version of Microsoft Windows.
  ;; (No others are supported by SBCL as of 1.0.8, but :hpux or :irix
  ;; support could be ported from CMU CL if anyone is sufficiently

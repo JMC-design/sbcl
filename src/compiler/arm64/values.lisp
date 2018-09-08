@@ -88,7 +88,7 @@
   (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
-  (:temporary (:scs (descriptor-reg) :type list :from (:argument 0)) list)
+  (:temporary (:scs (descriptor-reg) :from (:argument 0)) list)
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:vop-var vop)
@@ -104,8 +104,8 @@
     (loadw list list cons-cdr-slot list-pointer-lowtag)
     (inst add csp-tn csp-tn n-word-bytes)
     (storew temp csp-tn -1)
-    (test-type list LOOP nil (list-pointer-lowtag) :temp ndescr)
-    (error-call vop 'bogus-arg-to-values-list-error list)
+    (test-type list ndescr LOOP nil (list-pointer-lowtag))
+    (cerror-call vop 'bogus-arg-to-values-list-error list)
 
     DONE
     (inst sub count csp-tn start)

@@ -64,12 +64,16 @@ int arch_os_thread_init(struct thread *thread) {
     /* Signal handlers are run on the control stack, so if it is exhausted
      * we had better use an alternate stack for whatever signal tells us
      * we've exhausted it */
-    sigstack.ss_sp=((void *) thread)+dynamic_values_bytes;
-    sigstack.ss_flags=0;
-    sigstack.ss_size = 32*SIGSTKSZ;
+    sigstack.ss_sp    = calc_altstack_base(thread);
+    sigstack.ss_flags = 0;
+    sigstack.ss_size  = calc_altstack_size(thread);
     if(sigaltstack(&sigstack,0)<0) {
         lose("Cannot sigaltstack: %s\n",strerror(errno));
     }
+#endif
+#ifdef MEMORY_SANITIZER
+    asm("movq %%fs:0, %0\n\tleaq __msan_param_tls@TPOFF(%0), %0"
+        : "=r" (thread->msan_param_tls));
 #endif
     return 1;
 }
@@ -78,7 +82,7 @@ int arch_os_thread_init(struct thread *thread) {
  * defunct.  Not called on live threads
  */
 
-int arch_os_thread_cleanup(struct thread *thread) {
+int arch_os_thread_cleanup(struct thread __attribute__((unused)) *thread) {
     return 1;
 }
 
@@ -163,6 +167,7 @@ os_restore_fp_control(os_context_t *context)
 }
 
 void
-os_flush_icache(os_vm_address_t address, os_vm_size_t length)
+os_flush_icache(os_vm_address_t __attribute__((unused)) address,
+                os_vm_size_t __attribute__((unused)) length)
 {
 }

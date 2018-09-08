@@ -9,6 +9,9 @@
 
 (in-package "SB-INTERPRETER")
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (shadow "SYMEVAL"))
+
 ;;; Return a THE form that wraps EXPRESSION, but if CTYPE is NIL,
 ;;; just return EXPRESSION.
 (defun cast-to (ctype expression)
@@ -459,7 +462,7 @@
                 (catch (env-payload env) (,eval-fn forms env)))))
   (defspecial block (name &rest forms)
     (unless (symbolp name)
-      (ip-error "~@<The block name ~S is not a symbol.~:@>" name))
+      (%program-error "~@<The block name ~S is not a symbol.~:@>" name))
     :immediate (env) (eval-it eval-progn)
     :deferred ()
     (let ((forms (%progn forms)))
@@ -476,9 +479,9 @@
     ;; unfortunately the only way to write this OAOO is with an &AUX var
     (declare (fixnum depth))
     (unless (symbolp name)
-      (ip-error "~@<The block name ~S is not a symbol.~:@>" name))
+      (%program-error "~@<The block name ~S is not a symbol.~:@>" name))
     (loop (if (null block-env)
-              (ip-error "~@<Return for unknown block: ~S~:@>" name))
+              (%program-error "~@<Return for unknown block: ~S~:@>" name))
           (when (eq (typecase block-env
                       (lambda-env (car (lambda-env-block block-env)))
                       (block-env (car (env-payload block-env)))
@@ -521,10 +524,10 @@
         (cond ((consp item) (setq any-forms t))
               ((or (symbolp item) (integerp item))
                (if (assoc item (tags))
-                   (ip-error "Duplicate tag ~S in tagbody" item)
+                   (%program-error "Duplicate tag ~S in tagbody" item)
                    (tags (list item))))
               (t
-               (ip-error "Bad thing to appear in a tagbody: ~S" item))))
+               (%program-error "Bad thing to appear in a tagbody: ~S" item))))
       (cond ((not any-forms)
              (return-from parse-tagbody (return-constant nil)))
             ((not (tags))
@@ -635,7 +638,7 @@
   (let ((depth 0) cell)
     (declare (fixnum depth))
     (loop (typecase env
-            (null (ip-error "~@<Attempt to GO to nonexistent tag: ~S~:@>" tag))
+            (null (%program-error "~@<Attempt to GO to nonexistent tag: ~S~:@>" tag))
             (tagbody-env
              (when (setq cell (assoc tag (car (env-payload env)))) (return))))
        (setq env (env-parent env)) (incf depth))
@@ -652,7 +655,7 @@
          (when sexpr
            (setf (sexpr-handler sexpr) (return-constant nil)))
          nil)
-        ((oddp (list-length assignments)) (ip-error "Bad syntax in SETQ"))
+        ((oddp (list-length assignments)) (%program-error "Bad syntax in SETQ"))
         ((cddr assignments)
          (let ((form `(progn ,@(loop for (sym val) on assignments by #'cddr
                                      collect `(setq ,sym ,val)))))
@@ -662,7 +665,7 @@
         (t
          (let ((sym (first assignments)) (val (second assignments)))
            (unless (symbolp sym)
-             (ip-error "~S is not a symbol" sym))
+             (%program-error "~S is not a symbol" sym))
            (if sexpr
                (deferred-setq-1 sym val env sexpr)
                (immediate-setq-1 sym val env))))))
@@ -681,8 +684,9 @@
       (labels ((recurse (list forms)
                  (if (not list)
                      (dispatch forms env)
-                     (sb-sys:with-pinned-objects ((car list))
-                       (recurse (cdr list) forms)))))
+                     (let ((obj (dispatch (car list) env)))
+                       (sb-sys:with-pinned-objects (obj)
+                         (recurse (cdr list) forms))))))
         (recurse objects forms)))))
 
 ;;; Now for the complicated stuff, starting with the simplest
@@ -732,7 +736,7 @@
         (assert-declarable-as-special env specials))
       (dolist (symbol specials)
         (if (find symbol symbols :end n-macros :key #'car)
-            (ip-error "~S can not be both a symbol-macro and special" symbol))
+            (%program-error "~S can not be both a symbol-macro and special" symbol))
         (setf (svref symbols (incf index)) (find-special-binding env symbol)))
       (process-typedecls
        (%make-symbol-macro-scope decls (new-policy env decls)
@@ -777,7 +781,7 @@
                 (with-subforms (symbol &optional value) binding
                   (values symbol value)))
           (unless (symbolp symbol)
-            (ip-error "~S is not a symbol" symbol))
+            (%program-error "~S is not a symbol" symbol))
           (incf index)
           (setf (svref symbols index) (list symbol)
                 (svref values index) value-form)))
@@ -902,7 +906,7 @@
          (with-subforms (name lambda-list &body body) def
            (unless (and (symbolp name)
                         (neq (info :function :kind name) :special-form))
-             (ip-error "~S is not a valid macro name" name))
+             (%program-error "~S is not a valid macro name" name))
            (when (fboundp name)
              (with-package-lock-context (env)
                (program-assert-symbol-home-package-unlocked
@@ -1042,7 +1046,7 @@
                ;; of a consistent message as per the format string below.
                (unless (and (legal-fun-name-p name)
                             (neq (info :function :kind name) :special-form))
-                 (ip-error "~S is not a legal function name" name))
+                 (%program-error "~S is not a legal function name" name))
                (when (fboundp name)
                  (with-package-lock-context (env)
                    (program-assert-symbol-home-package-unlocked
@@ -1132,10 +1136,10 @@
     (defspecial* labels)))
 
 (macrolet ((not-a-function (name)
-             `(ip-error "~S is a macro." ,name)))
+             `(%program-error "~S is a macro." ,name)))
   (defspecial function (name)
     (if (and (symbolp name) (eq (info :function :kind name) :special-form))
-        (ip-error "~S names a special operator." name))
+        (%program-error "~S names a special operator." name))
     ;; again it's sad that I can't wrap code around both modes
     :immediate (env)
     (if (and (listp name) (memq (car name) '(named-lambda lambda)))

@@ -66,12 +66,14 @@
 
 ;;;; various conditional constructs
 
-(flet ((prognify (forms)
-         (cond ((singleton-p forms) (car forms))
-               ((not forms) nil)
+(flet ((prognify (forms env)
+         (cond ((not forms) nil)
+               ((and (singleton-p forms)
+                     (sb!c:policy env (= sb!c:store-coverage-data 0)))
+                (car forms))
                (t `(progn ,@forms)))))
   ;; COND defined in terms of IF
-  (sb!xc:defmacro cond (&rest clauses)
+  (sb!xc:defmacro cond (&rest clauses &environment env)
     (named-let make-clauses ((clauses clauses))
       (if (endp clauses)
           nil
@@ -92,33 +94,43 @@
                                  (not more))
                             ;; THE to preserve non-toplevelness for FOO in
                             ;;   (COND (T (FOO)))
-                            `(the t ,(prognify forms))
+                            `(the t ,(prognify forms env))
                             `(if ,test
-                                 ,(prognify forms)
+                                 ,(prognify forms env)
                                  ,(when more (make-clauses more))))))))))))
 
-  (sb!xc:defmacro when (test &body forms)
-  #!+sb-doc
+  (sb!xc:defmacro when (test &body forms &environment env)
   "If the first argument is true, the rest of the forms are
 evaluated as a PROGN."
-  `(if ,test ,(prognify forms)))
+  `(if ,test ,(prognify forms env)))
 
-  (sb!xc:defmacro unless (test &body forms)
-  #!+sb-doc
+  (sb!xc:defmacro unless (test &body forms &environment env)
   "If the first argument is not true, the rest of the forms are
 evaluated as a PROGN."
-  `(if ,test nil ,(prognify forms))))
+  `(if ,test nil ,(prognify forms env))))
 
 (sb!xc:defmacro and (&rest forms)
-  (named-let expand-forms ((nested nil) (forms forms))
+  (named-let expand-forms ((nested nil) (forms forms) (ignore-last nil))
     (cond ((endp forms) t)
           ((endp (rest forms))
-           ;; Preserve non-toplevelness of the form!
-           (let ((car (car forms))) (if nested car `(the t ,car))))
+           (let ((car (car forms)))
+             (cond (nested
+                    car)
+                   (t
+                    ;; Preserve non-toplevelness of the form!
+                    `(the t ,car)))))
+          ((and ignore-last
+                (endp (cddr forms)))
+           (car forms))
+          ;; Better code that way, since the result will only have two
+          ;; values, NIL or the last form, and the precedeing tests
+          ;; will only be used for jumps
+          ((and (not nested) (cddr forms))
+           `(if ,(expand-forms t forms t)
+                ,@(last forms)))
           (t
            `(if ,(first forms)
-                ,(expand-forms t (rest forms))
-                nil)))))
+                ,(expand-forms t (rest forms) ignore-last))))))
 
 (sb!xc:defmacro or (&rest forms)
   (named-let expand-forms ((nested nil) (forms forms))
@@ -158,7 +170,7 @@ evaluated as a PROGN."
 ;;;; DEFUN
 
 ;;; Should we save the inline expansion of the function named NAME?
-(defun inline-fun-name-p (name)
+(defun save-inline-expansion-p (name)
   (or
    ;; the normal reason for saving the inline expansion
    (let ((inlinep (info :function :inlinep name)))
@@ -175,23 +187,64 @@ evaluated as a PROGN."
    ;; what should we do with the old inline expansion when we see the
    ;; new DEFUN? Overwriting it with the new definition seems like
    ;; the only unsurprising choice.
-   (info :function :inline-expansion-designator name)))
+   (nth-value 1 (fun-name-inline-expansion name))))
+
+(defun extract-dx-args (lambda-list decl-forms)
+  (let (dx-decls)
+    (dolist (form decl-forms)
+      (dolist (expr (cdr form))
+        (when (eq (car expr) 'dynamic-extent)
+          (setf dx-decls (union dx-decls (cdr expr))))))
+    (unless dx-decls
+      (return-from extract-dx-args nil))
+    ;; TODO: in addition to ":SILENT T" supressing warnings, PARSE-LAMBDA-LIST
+    ;; needs to allow :CONDITION-CLASS = NIL to ask that no errors be signaled.
+    ;; An indicator can be returned so that at worst the code below does nothing.
+    (multiple-value-bind (llks required optional rest key aux)
+        (parse-lambda-list lambda-list :silent t)
+      (declare (ignore llks rest))
+      ;; We enforce uniqueness of the symbols in the union of REQUIRED,
+      ;; OPTIONAL, REST, KEY (including any supplied-p variables),
+      ;; but there may be an AUX binding shadowing a lambda binding.
+      ;; This affects something like:
+      ;;  (LAMBDA (X &AUX (X (MAKE-FOO X))) (DECLARE (DYNAMIC-EXTENT X))
+      ;; in which the decl does not pertain to argument X.
+      (let ((arg-index 0) caller-dxable)
+        (labels ((examine (sym dx-note)
+                   (when (and (member sym dx-decls) (not (shadowed-p sym)))
+                     (push dx-note caller-dxable))
+                   (incf arg-index))
+                 (shadowed-p (sym)
+                   (dolist (binding aux)
+                     (when (eq (if (listp binding) (car binding) binding) sym)
+                       (return t)))))
+          (dolist (spec required)
+            (examine spec arg-index))
+          (dolist (spec optional)
+            (examine (if (listp spec) (car spec) spec) arg-index))
+          (dolist (spec key)
+            (multiple-value-bind (keyword var) (parse-key-arg-spec spec)
+              (examine var keyword))))
+        (nreverse caller-dxable)))))
 
 (sb!xc:defmacro defun (&environment env name lambda-list &body body)
-  #!+sb-doc
   "Define a function at top level."
   #+sb-xc-host
   (unless (symbol-package (fun-name-block-name name))
     (warn "DEFUN of uninterned function name ~S (tricky for GENESIS)" name))
   (multiple-value-bind (forms decls doc) (parse-body body t)
+    ;; Maybe kill docstring, but only under the cross-compiler.
+    #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq doc nil)
     (let* (;; stuff shared between LAMBDA and INLINE-LAMBDA and NAMED-LAMBDA
            (lambda-guts `(,@decls (block ,(fun-name-block-name name) ,@forms)))
            (lambda `(lambda ,lambda-list ,@lambda-guts))
            (named-lambda `(named-lambda ,name ,lambda-list
-                            ,@(when doc (list doc)) ,@lambda-guts))
+                           ,@(when *top-level-form-p* '((declare (sb!c::top-level-form))))
+                           ,@(when doc (list doc)) ,@lambda-guts))
+           (dxable-args (extract-dx-args lambda-list decls))
            (inline-thing
             (or (sb!kernel::defstruct-generated-defn-p name lambda-list body)
-                (when (inline-fun-name-p name)
+                (when (save-inline-expansion-p name)
                   ;; we want to attempt to inline, so complain if we can't
                   (acond ((sb!c:maybe-inline-syntactic-closure lambda env)
                           (list 'quote it))
@@ -203,9 +256,10 @@ evaluated as a PROGN."
                           nil))))))
       `(progn
          (eval-when (:compile-toplevel)
-           (sb!c:%compiler-defun ',name ,inline-thing t))
-         (%defun ',name ,named-lambda (sb!c:source-location)
-                 ,@(and inline-thing (list inline-thing)))
+           (sb!c:%compiler-defun ',name t ,inline-thing ',dxable-args))
+         (%defun ',name ,named-lambda
+                 ,@(when (or inline-thing dxable-args) (list inline-thing))
+                 ,@(when dxable-args `(',dxable-args)))
          ;; This warning, if produced, comes after the DEFUN happens.
          ;; When compiling, there's no real difference, but when interpreting,
          ;; if there is a handler for style-warning that nonlocally exits,
@@ -216,32 +270,16 @@ evaluated as a PROGN."
                  (sb!c::warn-if-setf-macro ',name))
                ',name))))))
 
-#-sb-xc-host
-(defun %defun (name def source-location &optional inline-lambda)
-  (declare (type function def))
-  ;; should've been checked by DEFMACRO DEFUN
-  (aver (legal-fun-name-p name))
-  (sb!c:%compiler-defun name inline-lambda nil)
-  (when (fboundp name)
-    (warn 'redefinition-with-defun
-          :name name :new-function def :new-location source-location))
-  (setf (sb!xc:fdefinition name) def)
-  ;; %COMPILER-DEFUN doesn't do this except at compile-time, when it
-  ;; also checks package locks. By doing this here we let (SETF
-  ;; FDEFINITION) do the load-time package lock checking before
-  ;; we frob any existing inline expansions.
-  (sb!c::%set-inline-expansion name nil inline-lambda)
-  (sb!c::note-name-defined name :function)
-  name)
 
 ;;;; DEFVAR and DEFPARAMETER
 
 (sb!xc:defmacro defvar (var &optional (val nil valp) (doc nil docp))
-  #!+sb-doc
   "Define a special variable at top level. Declare the variable
   SPECIAL and, optionally, initialize it. If the variable already has a
   value, the old value is not clobbered. The third argument is an optional
   documentation string for the variable."
+  ;; Maybe kill docstring, but only under the cross-compiler.
+  #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq doc nil)
   `(progn
      (eval-when (:compile-toplevel)
        (%compiler-defvar ',var))
@@ -253,12 +291,13 @@ evaluated as a PROGN."
                      `(',doc)))))
 
 (sb!xc:defmacro defparameter (var val &optional (doc nil docp))
-  #!+sb-doc
   "Define a parameter that is not normally changed by the program,
   but that may be changed without causing an error. Declare the
   variable special and sets its value to VAL, overwriting any
   previous value. The third argument is an optional documentation
   string for the parameter."
+  ;; Maybe kill docstring, but only under the cross-compiler.
+  #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq doc nil)
   `(progn
      (eval-when (:compile-toplevel)
        (%compiler-defvar ',var))
@@ -266,30 +305,19 @@ evaluated as a PROGN."
                     ,@(and docp
                            `(',doc)))))
 
+(defun %compiler-defglobal (name always-boundp value assign-it-p)
+  (sb!xc:proclaim `(global ,name))
+  (when assign-it-p
+    (set-symbol-global-value name value))
+  (sb!c::process-variable-declaration
+   name 'always-bound
+   ;; don't "weaken" the proclamation if it's in fact always bound now
+   (if (eq (info :variable :always-bound name) :always-bound)
+       :always-bound
+       always-boundp)))
+
 (defun %compiler-defvar (var)
   (sb!xc:proclaim `(special ,var)))
-
-#-sb-xc-host
-(defun %defvar (var source-location &optional (val nil valp) (doc nil docp))
-  (%compiler-defvar var)
-  (when (and valp
-             (not (boundp var)))
-    (set var val))
-  (when docp
-    (setf (fdocumentation var 'variable) doc))
-  (when source-location
-    (setf (info :source-location :variable var) source-location))
-  var)
-
-#-sb-xc-host
-(defun %defparameter (var val source-location &optional (doc nil docp))
-  (%compiler-defvar var)
-  (set var val)
-  (when docp
-    (setf (fdocumentation var 'variable) doc))
-  (when source-location
-    (setf (info :source-location :variable var) source-location))
-  var)
 
 ;;;; iteration constructs
 
@@ -342,7 +370,6 @@ evaluated as a PROGN."
     (frob-do-body varlist endlist body 'let 'psetq 'do-anonymous (sb!xc:gensym)))
 
   (sb!xc:defmacro do (varlist endlist &body body)
-  #!+sb-doc
   "DO ({(Var [Init] [Step])}*) (Test Exit-Form*) Declaration* Form*
   Iteration construct. Each Var is initialized in parallel to the value of the
   specified Init form. On subsequent iterations, the Vars are assigned the
@@ -354,7 +381,6 @@ evaluated as a PROGN."
   (frob-do-body varlist endlist body 'let 'psetq 'do nil))
 
   (sb!xc:defmacro do* (varlist endlist &body body)
-  #!+sb-doc
   "DO* ({(Var [Init] [Step])}*) (Test Exit-Form*) Declaration* Form*
   Iteration construct. Each Var is initialized sequentially (like LET*) to the
   value of the specified Init form. On subsequent iterations, the Vars are
@@ -431,28 +457,8 @@ evaluated as a PROGN."
 
 ;;;; conditions, handlers, restarts
 
-;;; KLUDGE: we PROCLAIM these special here so that we can use restart
-;;; macros in the compiler before the DEFVARs are compiled.
-;;;
-;;; For an explanation of these data structures, see DEFVARs in
-;;; target-error.lisp.
-(sb!xc:proclaim '(special *handler-clusters* *restart-clusters*))
-
-;;; Generated code need not check for unbound-marker in *HANDLER-CLUSTERS*
-;;; (resp *RESTART-). To elicit this we must poke at the info db.
-;;; SB!XC:PROCLAIM SPECIAL doesn't advise the host Lisp that *HANDLER-CLUSTERS*
-;;; is special and so it rightfully complains about a SETQ of the variable.
-;;; But I must SETQ if proclaming ALWAYS-BOUND because the xc asks the host
-;;; whether it's currently bound.
-;;; But the DEFVARs are in target-error. So it's one hack or another.
-(setf (info :variable :always-bound '*handler-clusters*)
-      #+sb-xc :always-bound #-sb-xc :eventually)
-(setf (info :variable :always-bound '*restart-clusters*)
-      #+sb-xc :always-bound #-sb-xc :eventually)
-
 (sb!xc:defmacro with-condition-restarts
     (condition-form restarts-form &body body)
-  #!+sb-doc
   "Evaluates the BODY in a dynamic environment where the restarts in the list
    RESTARTS-FORM are associated with the condition returned by CONDITION-FORM.
    This allows FIND-RESTART, etc., to recognize restarts that are not related
@@ -471,7 +477,6 @@ evaluated as a PROGN."
            (pop (restart-associated-conditions ,restart)))))))
 
 (sb!xc:defmacro restart-bind (bindings &body forms)
-  #!+sb-doc
   "(RESTART-BIND ({(case-name function {keyword value}*)}*) forms)
    Executes forms in a dynamic context where the given bindings are in
    effect. Users probably want to use RESTART-CASE. A case-name of NIL
@@ -522,7 +527,6 @@ evaluated as a PROGN."
         expression)))
 
 (sb!xc:defmacro restart-case (expression &body clauses &environment env)
-  #!+sb-doc
   "(RESTART-CASE form {(case-name arg-list {keyword value}* body)}*)
    The form is evaluated in a dynamic context where the clauses have
    special meanings as points to which control may be transferred (see
@@ -594,15 +598,22 @@ evaluated as a PROGN."
              (make-apply-and-return (clause-data)
                (destructuring-bind (name tag keywords lambda-list body) clause-data
                  (declare (ignore name keywords))
-                 `(,tag (return-from ,block-tag
-                          ,(cond ((null lambda-list)
-                                  `(progn ,@body))
-                                 ((and (null (cdr lambda-list))
-                                       (not (member (car lambda-list)
-                                                    '(&optional &key &aux))))
-                                  `(funcall (lambda ,lambda-list ,@body) ,temp-var))
-                                 (t
-                                  `(apply (lambda ,lambda-list ,@body) ,temp-var))))))))
+                 (multiple-value-bind (body declarations) (parse-body body nil)
+                   `(,tag (return-from ,block-tag
+                            ,(cond ((null lambda-list)
+                                    `(locally ,@declarations ,@body))
+                                   ((and (null (cdr lambda-list))
+                                         (not (member (car lambda-list)
+                                                      '(&optional &key &aux))))
+                                    `(funcall (lambda ,lambda-list
+                                                ,@declarations
+                                                (progn ,@body))
+                                              ,temp-var))
+                                   (t
+                                    `(apply (lambda ,lambda-list
+                                              ,@declarations
+                                              (progn ,@body))
+                                            ,temp-var)))))))))
       (let ((clauses-data (mapcar #'parse-clause clauses)))
         `(block ,block-tag
            (let ((,temp-var nil))
@@ -617,7 +628,6 @@ evaluated as a PROGN."
 (sb!xc:defmacro with-simple-restart ((restart-name format-string
                                                        &rest format-arguments)
                                          &body forms)
-  #!+sb-doc
   "(WITH-SIMPLE-RESTART (restart-name format-string format-arguments)
    body)
    If restart-name is not invoked, then all values returned by forms are
@@ -657,28 +667,21 @@ evaluated as a PROGN."
     (flet ((const-cons (test handler)
              ;; If possible, render HANDLER as a load-time constant so that
              ;; consing the test and handler is also load-time constant.
-             (let ((name (when (typep handler
-                                      '(cons (member function quote)
-                                             (cons symbol null)))
-                           (cadr handler))))
-               (cond ((or (not name)
-                          (assq name (local-functions))
-                          (and (eq (car handler) 'function)
+             (let ((quote (car handler))
+                   (name (cadr handler)))
+               (cond ((and (eq quote 'function)
+                           (or (assq name (local-functions))
                                (sb!c::fun-locally-defined-p name env)))
                       `(cons ,(case (car test)
-                               ((named-lambda function) test)
-                               (t `(load-time-value ,test t)))
-                             ,(if (typep handler '(cons (eql function)))
-                                  handler
-                                  ;; Regardless of lexical policy, never allow
-                                  ;; a non-callable into handler-clusters.
-                                  `(let ((x ,handler))
-                                     (declare (optimize (safety 3)))
-                                     (the callable x)))))
+                                ((named-lambda function) test)
+                                (t `(load-time-value ,test t)))
+                             (the (function-designator (condition)) ,handler)))
                      ((info :function :info name) ; known
                       ;; This takes care of CONTINUE,ABORT,MUFFLE-WARNING.
                       ;; #' will be evaluated in the null environment.
-                      `(load-time-value (cons ,test #',name) t))
+                      `(load-time-value
+                        (cons ,test (the (function-designator (condition)) #',name))
+                        t))
                      (t
                       ;; For each handler specified as #'F we must verify
                       ;; that F is fboundp upon entering the binding scope.
@@ -693,7 +696,8 @@ evaluated as a PROGN."
                                         (find-or-create-fdefn ',name) t))))
                       ;; Resolve to an fdefn at load-time.
                       `(load-time-value
-                        (cons ,test (find-or-create-fdefn ',name))
+                        (cons ,test (find-or-create-fdefn
+                                     (the (function-designator (condition)) ',name)))
                         t)))))
 
            (const-list (items)
@@ -752,19 +756,31 @@ evaluated as a PROGN."
                        `(named-lambda (%handler-bind ,type) (c)
                           (declare (optimize (sb!c::verify-arg-count 0)))
                           (typep c ',type))))
-                ;; Compute the handler expression
-                (let ((lexpr (typecase handler
-                               ((cons (eql lambda)) handler)
-                               ((cons (eql function)
-                                      (cons (cons (eql lambda)) null))
-                                (cadr handler)))))
-                  (if lexpr
-                      (let ((name (let ((sb!xc:*gensym-counter*
-                                         (length (cluster-entries))))
-                                    (sb!xc:gensym "H"))))
-                        (local-functions `(,name ,@(rest lexpr)))
-                        `#',name)
-                      handler))))))))
+                ;; Compute the handler expression.
+                ;; Unless the expression is ({FUNCTION|QUOTE} <sym>), then create a
+                ;; new local function. If the supplied handler is spelled
+                ;; (LAMBDA ...) or #'(LAMBDA ...), then the local function is the
+                ;; lambda but named. If not spelled as such, the function funcalls
+                ;; the user's sexpr so that the compiler enforces callable-ness.
+                (if (typep handler '(cons (member function quote) (cons symbol null)))
+                    handler
+                    (let ((lexpr
+                           (typecase handler
+                             ;; These two are merely expansion prettifiers,
+                             ;; and not strictly necessary.
+                             ((cons (eql function) (cons (cons (eql lambda)) null))
+                              (cadr handler))
+                             ((cons (eql lambda))
+                              handler)
+                             (t
+                              ;; Should be (THE (FUNCTION-DESIGNATOR (CONDITION)))
+                              ;; but the cast kills DX allocation.
+                              `(lambda (c) (funcall ,handler c)))))
+                          (name (let ((sb!xc:*gensym-counter*
+                                       (length (cluster-entries))))
+                                  (sb!xc:gensym "H"))))
+                      (local-functions `(,name ,@(rest lexpr)))
+                      `#',name))))))))
 
       `(dx-flet ,(local-functions)
          ,@(dummy-forms)
@@ -774,7 +790,6 @@ evaluated as a PROGN."
            ,form)))))
 
 (sb!xc:defmacro handler-bind (bindings &body forms)
-  #!+sb-doc
   "(HANDLER-BIND ( {(type handler)}* ) body)
 
 Executes body in a dynamic context where the given handler bindings are in
@@ -792,7 +807,6 @@ condition."
                   #!+x86 (multiple-value-prog1 (progn ,@forms) (float-wait))))
 
 (sb!xc:defmacro handler-case (form &rest cases)
-  #!+sb-doc
   "(HANDLER-CASE form { (type ([var]) body) }* )
 
 Execute FORM in a context with handlers established for the condition types. A
@@ -812,16 +826,23 @@ specification."
                      ,@(remove no-error-clause cases)))))))
         (let* ((local-funs nil)
                (annotated-cases
-                (mapcar (lambda (case)
-                          (with-current-source-form (case)
-                            (with-unique-names (tag fun)
-                              (destructuring-bind (type ll &body body) case
-                                (push `(,fun ,ll ,@body) local-funs)
-                                (list tag type ll fun)))))
-                        cases)))
+                 (mapcar (lambda (case)
+                           (with-current-source-form (case)
+                             (with-unique-names (tag fun)
+                               (destructuring-bind (type ll &body body) case
+                                 (unless (and (listp ll)
+                                              (symbolp (car ll))
+                                              (null (cdr ll)))
+                                   (error "Malformed HANDLER-CASE lambda-list. Should be either () or (symbol), not ~s."
+                                          ll))
+                                 (multiple-value-bind (body declarations)
+                                     (parse-body body nil)
+                                   (push `(,fun ,ll ,@declarations (progn ,@body)) local-funs))
+                                 (list tag type ll fun)))))
+                         cases)))
           (with-unique-names (block cell form-fun)
             `(dx-flet ((,form-fun ()
-                         #!-x86 ,form
+                         #!-x86 (progn ,form) ;; no declarations are accepted
                          ;; Need to catch FP errors here!
                          #!+x86 (multiple-value-prog1 ,form (float-wait)))
                        ,@(reverse local-funs))

@@ -13,15 +13,6 @@
 
 ;;;; Type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst and result object lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -102,7 +93,8 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst lsr res res n-widetag-bits)))
+    (inst ubfm res res n-widetag-bits
+          (+ -1 (integer-length short-header-max-words) n-widetag-bits))))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -122,15 +114,14 @@
     (storew t1 x 0 other-pointer-lowtag)
     (move res x)))
 
-
 (define-vop (pointer-hash)
   (:translate pointer-hash)
   (:args (ptr :scs (any-reg descriptor-reg)))
   (:results (res :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
   (:generator 1
-    (inst and res ptr (bic-mask lowtag-mask))
-    (inst lsr res res 1)))
+    (inst and res ptr (dpb -1 (byte (- n-word-bits n-fixnum-tag-bits 1)
+                                    n-fixnum-tag-bits) 0))))
 
 ;;;; Allocation
 
@@ -168,8 +159,7 @@
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst ubfm ndescr ndescr n-widetag-bits (+ 15 n-widetag-bits))
+    (inst ldr (32-bit-reg ndescr) (@ code (- 4 other-pointer-lowtag)))
     (inst add sap code (lsl ndescr word-shift))
     (inst sub sap sap other-pointer-lowtag)))
 
@@ -180,13 +170,11 @@
   (:results (func :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst ubfm ndescr ndescr n-widetag-bits (+ 15 n-widetag-bits))
+    (inst ldr (32-bit-reg ndescr) (@ code (- 4 other-pointer-lowtag)))
     (inst add ndescr offset (lsl ndescr word-shift))
     (inst sub ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))
 ;;;
-#!+symbol-info-vops
 (define-vop (symbol-info-vector)
   (:policy :fast-safe)
   (:translate symbol-info-vector)
@@ -202,7 +190,6 @@
     (loadw res res cons-cdr-slot list-pointer-lowtag)
     NE))
 
-#!+symbol-info-vops
 (define-vop (symbol-plist)
   (:policy :fast-safe)
   (:translate symbol-plist)
@@ -239,9 +226,6 @@
 
 #!+sb-thread
 (progn
-  (defknown current-thread-offset-sap (word)
-      system-area-pointer (flushable))
-
   (defun ldr-str-word-offset-encodable (x)
     (ldr-str-offset-encodable (ash x word-shift)))
 
@@ -259,8 +243,8 @@
     (:results (sap :scs (sap-reg)))
     (:result-types system-area-pointer)
     (:translate current-thread-offset-sap)
-    (:args (n :scs (unsigned-reg) :target sap))
-    (:arg-types unsigned-num)
+    (:args (n :scs (signed-reg) :target sap))
+    (:arg-types signed-num)
     (:policy :fast-safe)
     (:generator 2
                 (inst ldr sap (@ thread-tn (extend n :lsl word-shift))))))

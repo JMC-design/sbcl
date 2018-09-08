@@ -24,9 +24,12 @@
 #include "breakpoint.h"
 #include "thread.h"
 #include "pseudo-atomic.h"
+#include "forwarding-ptr.h"
+#include "var-io.h"
 
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
+#include "genesis/vector.h"
 
 #define BREAKPOINT_INST 0xcc    /* INT3 */
 #define UD2_INST 0x0b0f         /* UD2 */
@@ -88,9 +91,7 @@ void arch_skip_instruction(os_context_t *context)
      * past it. Skip the code; after that, if the code is an
      * error-trap or cerror-trap then skip the data bytes that follow. */
 
-    int vlen;
     int code;
-
 
     /* Get and skip the Lisp interrupt code. */
     code = *(char*)(*os_context_pc_addr(context))++;
@@ -98,12 +99,7 @@ void arch_skip_instruction(os_context_t *context)
         {
         case trap_Error:
         case trap_Cerror:
-            /* Lisp error arg vector length */
-            vlen = *(char*)(*os_context_pc_addr(context))++;
-            /* Skip Lisp error arg data bytes. */
-            while (vlen-- > 0) {
-                ++*os_context_pc_addr(context);
-            }
+            skip_internal_error(context);
             break;
 
         case trap_Breakpoint:           /* not tested */
@@ -322,7 +318,7 @@ sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
     }
 #endif
     fake_foreign_function_call(context);
-    lose("Unhandled SIGILL");
+    lose("Unhandled SIGILL at %p.", (void*)*os_context_pc_addr(context));
 }
 #endif /* not LISP_FEATURE_WIN32 */
 
@@ -348,14 +344,72 @@ arch_install_interrupt_handlers()
     SHOW("returning from arch_install_interrupt_handlers()");
 }
 
-#ifdef LISP_FEATURE_LINKAGE_TABLE
-/* FIXME: It might be cleaner to generate these from the lisp side of
- * things.
- */
 
 void
-arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+gencgc_apply_code_fixups(struct code *old_code, struct code *new_code)
 {
+    char* code_start_addr = (char*)(code_header_words(new_code->header)
+                                    + (lispobj*)new_code);
+    os_vm_size_t displacement = (char*)new_code - (char*)old_code;
+    lispobj fixups = new_code->fixups;
+    /* It will be a nonzero integer if valid, or 0 if there are no fixups */
+    if (fixups == 0)
+        return;
+
+    /* Could be pointing to a forwarding pointer. */
+    /* This is extremely unlikely, because the only referent of the fixups
+       is usually the code itself; so scavenging the vector won't occur
+       until after the code object is known to be live. As we're just now
+       enlivening the code, the fixups shouldn't have been forwarded.
+       Maybe the vector is on the special binding stack though ... */
+    if (is_lisp_pointer(fixups) &&
+        forwarding_pointer_p(native_pointer(fixups)))  {
+        /* If so, then follow it. */
+        /*SHOW("following pointer to a forwarding pointer");*/
+        fixups = forwarding_pointer_value(native_pointer(fixups));
+    }
+
+    if (fixnump(fixups) ||
+        (lowtag_of(fixups) == OTHER_POINTER_LOWTAG
+         && widetag_of(native_pointer(fixups)) == BIGNUM_WIDETAG)) {
+        /* Got the fixups for the code block. Now work through them
+           in order, first the absolute ones, then the relative.
+           Locations are sorted and delta-encoded for compactness. */
+        struct varint_unpacker unpacker;
+        varint_unpacker_init(&unpacker, fixups);
+        int prev_offset = 0, offset;
+        // Absolute fixups all refer to this object itself (the code
+        // boxed constants). Add this object's displacement to the
+        // value that currently exists at the fixup location.
+        while (varint_unpack(&unpacker, &offset) && offset != 0) {
+            offset += prev_offset;
+            prev_offset = offset;
+            *(char**)(code_start_addr + offset) += displacement;
+        }
+        prev_offset = 0;
+        // Relative fixups: assembly and foreign routines. Subtract this
+        // object's displacement from the value that currently exists.
+        while (varint_unpack(&unpacker, &offset) && offset != 0) {
+            offset += prev_offset;
+            prev_offset = offset;
+            *(char**)(code_start_addr + offset) -= displacement;
+        }
+    } else {
+        /* This used to just print a note to stderr, but bogus fixups seem to
+         * indicate real heap corruption, so a hard failure is in order. */
+        lose("fixup vector %x has a bad widetag: %#x",
+             fixups, widetag_of(native_pointer(fixups)));
+    }
+}
+
+#ifdef LISP_FEATURE_LINKAGE_TABLE
+void
+arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
+{
+    if (datap) {
+        *(unsigned long *)reloc_addr = (unsigned long)target_addr;
+        return;
+    }
     /* Make JMP to function entry. JMP offset is calculated from next
      * instruction.
      */
@@ -371,11 +425,4 @@ arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
     /* write a nop for good measure. */
     *reloc_addr = 0x90;
 }
-
-void
-arch_write_linkage_table_ref(void *reloc_addr, void *target_addr)
-{
-    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-}
-
 #endif

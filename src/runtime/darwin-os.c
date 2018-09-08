@@ -112,6 +112,7 @@ setup_mach_exception_handling_thread()
     FSHOW((stderr, "Creating mach_exception_handler thread!\n"));
 
     pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, PTHREAD_STACK_MIN);
     pthread_create(&mach_exception_handling_thread,
                    &attr,
                    mach_exception_handler,
@@ -154,7 +155,7 @@ mach_lisp_thread_init(struct thread * thread)
 
     current_mach_thread = mach_thread_self();
     ret = thread_set_exception_ports(current_mach_thread,
-                                     EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION,
+                                     EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_BREAKPOINT,
                                      thread_exception_port,
                                      EXCEPTION_DEFAULT,
                                      THREAD_STATE_NONE);
@@ -193,24 +194,16 @@ mach_lisp_thread_destroy(struct thread *thread) {
         lose("Error destroying an exception port");
     }
 }
+#endif
 
 void
-setup_mach_exceptions() {
+darwin_reinit() {
+    init_mach_clock();
+#ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
     setup_mach_exception_handling_thread();
     mach_lisp_thread_init(all_threads);
-}
-
-pid_t
-mach_fork() {
-    pid_t pid = fork();
-    if (pid == 0) {
-        setup_mach_exceptions();
-        return pid;
-    } else {
-        return pid;
-    }
-}
 #endif
+}
 
 void darwin_init(void)
 {
@@ -254,7 +247,8 @@ os_sem_wait(os_sem_t *sem, char *what)
     case KERN_ABORTED:
         goto restart;
     default:
-        lose("%s: os_sem_wait(%p): %lu, %s", what, sem, ret, strerror(errno));
+        lose("%s: os_sem_wait(%p): %lu, %s",
+             what, sem, (long unsigned)ret, strerror(errno));
     }
 }
 
@@ -358,7 +352,7 @@ sb_nanosleep(time_t sec, int nsec) {
 
     ret = clock_get_time(clock_port, &start_time);
     if (ret != KERN_SUCCESS) {
-            lose(mach_error_string(ret));
+            lose("%s", mach_error_string(ret));
     }
 
     for (;;) {
@@ -373,7 +367,7 @@ sb_nanosleep(time_t sec, int nsec) {
             if (errno == EINTR) {
                 ret = clock_get_time(clock_port, &current_time);
                 if (ret != KERN_SUCCESS) {
-                    lose(mach_error_string(ret));
+                    lose("%s", mach_error_string(ret));
                 }
                 time_t elapsed_sec = current_time.tv_sec - start_time.tv_sec;
                 int elapsed_nsec = current_time.tv_nsec - start_time.tv_nsec;

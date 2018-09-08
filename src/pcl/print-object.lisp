@@ -33,13 +33,16 @@
 ;;; by the printer doing bootstrapping, and immediately replace it
 ;;; with some new printing logic, so that the Lisp printer stays
 ;;; crippled only for the shortest necessary time.
-(write-string "; Removing placeholder PRINT-OBJECT ...") (force-output)
+(unless (sb-impl::!c-runtime-noinform-p)
+  (write-string "; Removing placeholder PRINT-OBJECT ...")
+  (force-output))
 (let ((*print-pretty* t)) ; use pretty printer dispatch table, not PRINT-OBJECT
   (fmakunbound 'print-object)
   (defgeneric print-object (object stream))
   (!incorporate-cross-compiled-methods 'print-object))
-(write-string " done
-")
+(unless (sb-impl::!c-runtime-noinform-p)
+  (write-string " done
+"))
 
 ;;;; PRINT-OBJECT methods for objects from PCL classes
 ;;;;
@@ -47,12 +50,15 @@
 (defmethod print-object ((object standard-object) stream)
   (print-unreadable-object (object stream :type t :identity t)))
 
+(defmethod print-object ((object funcallable-standard-object) stream)
+  (print-unreadable-object (object stream :type t :identity t)))
+
 (defmethod print-object ((method standard-method) stream)
   (if (slot-boundp method '%generic-function)
       (print-unreadable-object (method stream :type t :identity t)
         (let ((generic-function (method-generic-function method))
               (*print-length* 50))
-          (format stream "~:[~*~;~/sb-impl::print-symbol-with-prefix/ ~]~{~S ~}~:S"
+          (format stream "~:[~*~;~/sb-ext:print-symbol-with-prefix/ ~]~{~S ~}~:S"
                   generic-function
                   (and generic-function
                        (generic-function-name generic-function))
@@ -66,7 +72,7 @@
   (if (slot-boundp method '%generic-function)
       (print-unreadable-object (method stream :type t :identity t)
         (let ((generic-function (method-generic-function method)))
-          (format stream "~/sb-impl::print-symbol-with-prefix/, slot:~S, ~:S"
+          (format stream "~/sb-ext:print-symbol-with-prefix/, slot:~S, ~:S"
                   (and generic-function
                        (generic-function-name generic-function))
                   (accessor-method-slot-name method)
@@ -88,7 +94,7 @@
          (let ((name (slot-value instance 'name)))
            (print-unreadable-object
                (instance stream :type t :identity (not properly-named-p))
-             (format stream "~/sb-impl::print-symbol-with-prefix/~:[~:; ~:S~]"
+             (format stream "~/sb-ext:print-symbol-with-prefix/~:[~:; ~:S~]"
                      name extra-p extra))))
         ((not extra-p) ; case (2): empty body to avoid an extra space
          (print-unreadable-object (instance stream :type t :identity t)))
@@ -149,11 +155,11 @@
   (print-unreadable-object (obj stream :type t)
     (format stream "~D" (cpd-count obj))))
 
-(defmethod print-object ((self eql-specializer) stream)
-  (let ((have-obj (slot-boundp self 'object)))
-    (print-unreadable-object (self stream :type t :identity (not have-obj))
-      (when have-obj
-        (write (slot-value self 'object) :stream stream)))))
+(defmethod print-object ((self specializer-with-object) stream)
+  (if (and (slot-exists-p self 'object) (slot-boundp self 'object))
+      (print-unreadable-object (self stream :type t)
+        (write (slot-value self 'object) :stream stream))
+      (print-unreadable-object (self stream :type t :identity t))))
 
 sb-c::
 (defmethod print-object ((self policy) stream)
@@ -174,9 +180,7 @@ sb-kernel::(progn
               (datum (maybe-string (type-error-datum condition))))
           (if (and type datum)
               (print-unreadable-object (condition stream :type t)
-                (format stream "~@<expected-type: ~
-                                 ~/sb-impl:print-type-specifier/~_datum: ~
-                                 ~A~:@>"
+                (format stream "~@<expected-type: ~A ~_datum: ~A~:@>"
                         type datum))
               (call-next-method))))
       (call-next-method)))

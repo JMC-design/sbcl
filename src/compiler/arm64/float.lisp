@@ -378,6 +378,8 @@
                   (:variant :double  ,is-=)))))
   (frob < :mi </single-float </double-float nil)
   (frob > :gt >/single-float >/double-float nil)
+  (frob <= :le <=/single-float <=/double-float nil)
+  (frob >= :ge >=/single-float >=/double-float nil)
   (frob = :eq eql/single-float eql/double-float t))
 
 (define-vop (float-compare-zero)
@@ -400,7 +402,7 @@
                 (:args (x :scs (,sc)))
                 (:arg-types ,ptype (:constant, constant-type)))))
   (frob single-float-compare-zero single-reg single-float
-        (single-float -0s0 0s0))
+        (single-float -0f0 0f0))
   (frob double-float-compare-zero double-reg double-float
         (double-float -0d0 0d0)))
 
@@ -416,6 +418,8 @@
                   (:variant ,is-=)))))
   (frob < :mi </single-float-zero </double-float-zero nil)
   (frob > :gt >/single-float-zero >/double-float-zero nil)
+  (frob <= :le <=/single-float-zero <=/double-float-zero nil)
+  (frob >= :ge >=/single-float-zero >=/double-float-zero nil)
   (frob = :eq eql/single-float-zero eql/double-float-zero t))
 
 ;;;; Conversion:
@@ -677,7 +681,7 @@
                 (inst str imag
                       (@ nfp (load-store-offset (+ (* offset n-word-bytes) 4)))))
                ((ldp-stp-offset-p offset 32)
-                (inst stp real imag (@ nfp offset)))
+                (inst stp real imag (@ nfp (* offset n-word-bytes))))
                (t
                 (storew real nfp offset)
                 (inst str imag
@@ -707,7 +711,7 @@
          (cond ((location= real r)
                 (storew imag nfp (1+ offset)))
                ((ldp-stp-offset-p offset 64)
-                (inst stp real imag (@ nfp offset)))
+                (inst stp real imag (@ nfp (* offset n-word-bytes))))
                (t
                 (storew real nfp offset)
                 (storew imag nfp (1+ offset)))))))))

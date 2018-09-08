@@ -19,18 +19,6 @@
 (defvar *undefined-warnings*)
 (declaim (list *undefined-warnings*))
 
-;;; Look up some symbols in *FREE-VARS*, returning the var
-;;; structures for any which exist. If any of the names aren't
-;;; symbols, we complain.
-(declaim (ftype (function (list) list) get-old-vars))
-(defun get-old-vars (names)
-  (collect ((vars))
-    (dolist (name names (vars))
-      (unless (symbolp name)
-        (compiler-error "The name ~S is not a symbol." name))
-      (let ((old (gethash name *free-vars*)))
-        (when old (vars old))))))
-
 (declaim (ftype (function (list list) list)
                 process-handle-conditions-decl))
 (defun process-handle-conditions-decl (spec list)
@@ -39,9 +27,11 @@
       (destructuring-bind (typespec restart-name) clause
         (let ((type (compiler-specifier-type typespec))
               (ospec (rassoc restart-name new :test #'eq)))
-          (if ospec
-              (setf (car ospec) (type-union (car ospec) type))
-              (push (cons type restart-name) new)))))))
+          (cond ((not type))
+                (ospec
+                 (setf (car ospec) (type-union (car ospec) type)))
+                (t
+                 (push (cons type restart-name) new))))))))
 
 (declaim (ftype (function (list list) list)
                 process-muffle-conditions-decl))
@@ -55,17 +45,17 @@
 (defun process-unhandle-conditions-decl (spec list)
   (let ((new (copy-alist list)))
     (dolist (clause (cdr spec) new)
-      (destructuring-bind (typespec restart-name) clause
-        (let ((ospec (rassoc restart-name new :test #'eq)))
-          (if ospec
-              (let ((type (type-intersection
-                           (car ospec)
-                           (compiler-specifier-type `(not ,typespec)))))
-                (if (type= type *empty-type*)
-                    (setq new (delete restart-name new :test #'eq :key #'cdr))
-                    (setf (car ospec) type)))
-              ;; do nothing?
-              nil))))))
+      (block nil
+       (destructuring-bind (typespec restart-name) clause
+         (let ((ospec (rassoc restart-name new :test #'eq)))
+           (when ospec
+             (let ((type (type-intersection
+                          (car ospec)
+                          (or (compiler-specifier-type `(not ,typespec))
+                              (return)))))
+               (if (type= type *empty-type*)
+                   (setq new (delete restart-name new :test #'eq :key #'cdr))
+                   (setf (car ospec) type))))))))))
 
 (declaim (ftype (function (list list) list)
                 process-unmuffle-conditions-decl))
@@ -93,7 +83,9 @@
     (error "Cannot proclaim a non-symbol as ~A: ~S" kind name))
 
   (when (and (eq kind 'always-bound) (eq info-value :always-bound)
-             (not (boundp name)))
+             (not (boundp name))
+             ;; Allow it to be unbound at compile-time.
+             (not *compile-time-eval*))
     (error "Cannot proclaim an unbound symbol as ~A: ~S" kind name))
 
   (multiple-value-bind (allowed test)
@@ -222,7 +214,8 @@
             software version name replacement))
          (setf (info :function :deprecated name) info))
         (variable
-         ;; TODO (check-variable-name name "deprecated variable declaration")
+         (check-variable-name
+          name :context "deprecated variable declaration" :signal-via #'error)
          (when (eq state :final)
            (sb!impl::setup-variable-in-final-deprecation
             software version name replacement))
@@ -276,7 +269,11 @@
                (if location
                    (setf (getf (info :source-location :declaration name) key)
                          location)
-                   (remf (info :source-location :declaration name) key)))
+                   ;; Without this WHEN, globaldb would accumulate
+                   ;; a bunch of explicitly stored empty lists because
+                   ;; it does not know that there's no need to store NIL.
+                   (when (info :source-location :declaration name)
+                     (remf (info :source-location :declaration name) key))))
              (map-names (names function &rest extra-args)
                (mapc (lambda (name)
                        (store-location name)
@@ -324,11 +321,11 @@
            (multiple-value-bind (state software version)
                (check-deprecation-declaration state since form)
              (mapc (lambda (thing)
+                     (process-deprecation-declaration thing state software version)
                      (destructuring-bind (namespace name &rest rest) thing
                        (declare (ignore rest))
                        (store-location
-                        name :key (deprecation-location-key namespace)))
-                     (process-deprecation-declaration thing state software version))
+                        name :key (deprecation-location-key namespace))))
                    things))))
         (declaration
          (map-args #'process-declaration-declaration form))
@@ -337,7 +334,7 @@
            (compiler-warn "unrecognized declaration ~S" raw-form)))))))
 
 (defun sb!xc:proclaim (raw-form)
-  #!+(and sb-show (host-feature sb-xc) (not win32))
+  #!+(and sb-show (host-feature sb-xc))
   (progn (write-string "* ") (write `(declaim ,raw-form) :level nil) (terpri))
   (%proclaim raw-form nil)
   (values))

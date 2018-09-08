@@ -12,25 +12,6 @@
 ;;;; files for more information.
 
 (in-package "SB!IMPL")
-
-;;;; magic specials initialized by GENESIS
-
-;;; FIXME: The DEFVAR here is redundant with the (DECLAIM (SPECIAL ..))
-;;; of all static symbols in early-impl.lisp.
-(progn
-  (defvar sb!vm::*current-catch-block*)
-  (defvar sb!vm::*current-unwind-protect-block*)
-  #!+hpux (defvar sb!vm::*c-lra*)
-  (defvar *free-interrupt-context-index*))
-
-;;; specials initialized by !COLD-INIT
-
-;;; FIXME: These could be converted to DEFVARs.
-(declaim (special #!+(or x86 x86-64) *pseudo-atomic-bits*
-                  *allow-with-interrupts*
-                  *interrupts-enabled*
-                  *interrupt-pending*
-                  #!+sb-thruption *thruption-pending*))
 
 ;;;; default initfiles
 
@@ -48,15 +29,13 @@
 (defun userinit-pathname ()
   (merge-pathnames ".sbclrc" (user-homedir-pathname)))
 
-(defvar *sysinit-pathname-function* #'sysinit-pathname
-  #!+sb-doc
+(define-load-time-global *sysinit-pathname-function* #'sysinit-pathname
   "Designator for a function of zero arguments called to obtain a
 pathname designator for the default sysinit file, or NIL. If the
 function returns NIL, no sysinit file is used unless one has been
 specified on the command-line.")
 
-(defvar *userinit-pathname-function* #'userinit-pathname
-  #!+sb-doc
+(define-load-time-global *userinit-pathname-function* #'userinit-pathname
   "Designator for a function of zero arguments called to obtain a
 pathname designator or a stream for the default userinit file, or NIL.
 If the function returns NIL, no userinit file is used unless one has
@@ -78,11 +57,10 @@ been specified on the command-line.")
                 (call-exit-hooks)))
          (%exit)))))
 
-(defvar *exit-lock*)
-(defvar *exit-in-process* nil)
+(define-load-time-global *exit-lock* nil)
+(!define-thread-local *exit-in-process* nil)
 (declaim (type (or null real) *exit-timeout*))
 (defvar *exit-timeout* 60
-  #!+sb-doc
   "Default amount of seconds, if any, EXIT should wait for other
 threads to finish after terminating them. Default value is 60. NIL
 means to wait indefinitely.")
@@ -117,15 +95,27 @@ means to wait indefinitely.")
 
 ;;;; miscellaneous external functions
 
+(declaim (inline split-ratio-for-sleep))
+(defun split-ratio-for-sleep (seconds)
+  (declare (ratio seconds)
+           (muffle-conditions compiler-note))
+  (multiple-value-bind (quot rem) (truncate (numerator seconds)
+                                            (denominator seconds))
+    (values quot
+            (* rem
+               #.(if (sb!xc:typep 1000000000 'fixnum)
+                     '(truncate 1000000000 (denominator seconds))
+                     ;; Can't truncate a bignum by a fixnum without consing
+                     '(* 10 (truncate 100000000 (denominator seconds))))))))
+
 (defun split-seconds-for-sleep (seconds)
-  (declare (muffle-conditions t))
-  (declare (optimize speed))
+  (declare (muffle-conditions compiler-note))
   ;; KLUDGE: This whole thing to avoid consing floats
   (flet ((split-float ()
            (let ((whole-seconds (truly-the fixnum (%unary-truncate seconds))))
              (values whole-seconds
                      (truly-the (integer 0 #.(expt 10 9))
-                                (%unary-truncate (* (- seconds (float whole-seconds))
+                                (%unary-truncate (* (- seconds (float whole-seconds seconds))
                                                     (load-time-value 1f9 t))))))))
     (declare (inline split-float))
     (typecase seconds
@@ -134,21 +124,46 @@ means to wait indefinitely.")
       ((double-float 0d0 #.(float sb!xc:most-positive-fixnum 1d0))
        (split-float))
       (ratio
-       (multiple-value-bind (quot rem) (truncate (numerator seconds)
-                                                 (denominator seconds))
-         (values quot
-                 (* rem
-                    #.(if (sb!xc:typep 1000000000 'fixnum)
-                          '(truncate 1000000000 (denominator seconds))
-                          ;; Can't truncate a bignum by a fixnum without consing
-                          '(* 10 (truncate 100000000 (denominator seconds))))))))
+       (split-ratio-for-sleep seconds))
       (t
        (multiple-value-bind (sec frac)
            (truncate seconds)
          (values sec (truncate frac (load-time-value 1f-9 t))))))))
 
+(declaim (inline %nanosleep))
+(defun %nanosleep (sec nsec)
+  ;; nanosleep() accepts time_t as the first argument, but on some
+  ;; platforms it is restricted to 100 million seconds. Maybe someone
+  ;; can actually have a reason to sleep for over 3 years?
+  (loop while (> sec (expt 10 8))
+     do (decf sec (expt 10 8))
+       (sb!unix:nanosleep (expt 10 8) 0))
+  (sb!unix:nanosleep sec nsec))
+
+(declaim (inline %sleep))
+#!-win32
+(defun %sleep (seconds)
+  (typecase seconds
+    (double-float
+     (sb!unix::nanosleep-double seconds))
+    (single-float
+     (sb!unix::nanosleep-float seconds))
+    (integer
+     (%nanosleep seconds 0))
+    (t
+     (multiple-value-call #'%nanosleep (split-ratio-for-sleep seconds)))))
+
+#!+(and win32 sb-thread)
+(defun %sleep (seconds)
+  (if (integerp seconds)
+      (%nanosleep seconds 0)
+      (multiple-value-call #'%nanosleep (split-seconds-for-sleep seconds))))
+
+#!+(and win32 (not sb-thread))
+(defun %sleep (seconds)
+  (sb!win32:millisleep (truncate (* seconds 1000))))
+
 (defun sleep (seconds)
-  #!+sb-doc
   "This function causes execution to be suspended for SECONDS. SECONDS may be
 any non-negative real number."
   (declare (explicit-check))
@@ -160,39 +175,51 @@ any non-negative real number."
            :format-arguments (list seconds)
            :datum seconds
            :expected-type '(real 0)))
-  #!-(and win32 (not sb-thread))
-  (multiple-value-bind (sec nsec)
-      (if (integerp seconds)
-          (values seconds 0)
-          (split-seconds-for-sleep seconds))
-    ;; nanosleep() accepts time_t as the first argument, but on some platforms
-    ;; it is restricted to 100 million seconds. Maybe someone can actually
-    ;; have a reason to sleep for over 3 years?
-    (loop while (> sec (expt 10 8))
-          do (decf sec (expt 10 8))
-             (sb!unix:nanosleep (expt 10 8) 0))
-    (sb!unix:nanosleep sec nsec))
-  #!+(and win32 (not sb-thread))
-  (sb!win32:millisleep (truncate (* seconds 1000)))
+  (if *deadline*
+      (let ((start (get-internal-real-time))
+            ;; SECONDS can be too large to present as INTERNAL-TIME,
+            ;; use the largest representable value in that case.
+            (timeout (or (seconds-to-maybe-internal-time seconds)
+                         (* safe-internal-seconds-limit
+                            internal-time-units-per-second))))
+        (labels ((sleep-for-a-bit (remaining)
+                   (multiple-value-bind
+                         (timeout-sec timeout-usec stop-sec stop-usec deadlinep)
+                       (decode-timeout (/ remaining internal-time-units-per-second))
+                     (declare (ignore stop-sec stop-usec))
+                     ;; Sleep until either the timeout or the deadline
+                     ;; expires.
+                     (when (or (plusp timeout-sec) (plusp timeout-usec))
+                       (%nanosleep timeout-sec (* 1000 timeout-usec)))
+                     ;; If the deadline expired first, signal the
+                     ;; DEADLINE-TIMEOUT. If the deadline is deferred
+                     ;; or canceled, go back to sleep for the
+                     ;; remaining time (if any).
+                     (when deadlinep
+                       (signal-deadline)
+                       (let ((remaining (- timeout
+                                           (- (get-internal-real-time) start))))
+                         (when (plusp remaining)
+                           (sleep-for-a-bit remaining)))))))
+          (sleep-for-a-bit timeout)))
+      (%sleep seconds))
   nil)
 
 ;;;; the default toplevel function
 
 (defvar / nil
-  #!+sb-doc
   "a list of all the values returned by the most recent top level EVAL")
-(defvar //  nil #!+sb-doc "the previous value of /")
-(defvar /// nil #!+sb-doc "the previous value of //")
-(defvar *   nil #!+sb-doc "the value of the most recent top level EVAL")
-(defvar **  nil #!+sb-doc "the previous value of *")
-(defvar *** nil #!+sb-doc "the previous value of **")
-(defvar +   nil #!+sb-doc "the value of the most recent top level READ")
-(defvar ++  nil #!+sb-doc "the previous value of +")
-(defvar +++ nil #!+sb-doc "the previous value of ++")
-(defvar -   nil #!+sb-doc "the form currently being evaluated")
+(defvar //  nil "the previous value of /")
+(defvar /// nil "the previous value of //")
+(defvar *   nil "the value of the most recent top level EVAL")
+(defvar **  nil "the previous value of *")
+(defvar *** nil "the previous value of **")
+(defvar +   nil "the value of the most recent top level READ")
+(defvar ++  nil "the previous value of +")
+(defvar +++ nil "the previous value of ++")
+(defvar -   nil "the form currently being evaluated")
 
 (defun interactive-eval (form &key (eval #'eval))
-  #!+sb-doc
   "Evaluate FORM, returning whatever it returns and adjusting ***, **, *,
 +++, ++, +, ///, //, /, and -."
   (setf - form)
@@ -245,27 +272,6 @@ any non-negative real number."
             (force-output stream))))
       :next))
   (values))
-
-(defun process-init-file (specified-pathname kind)
-  (multiple-value-bind (context default-function)
-      (ecase kind
-        (:system
-         (values "sysinit" *sysinit-pathname-function*))
-        (:user
-         (values "userinit" *userinit-pathname-function*)))
-    (if specified-pathname
-        (with-open-file (stream (parse-native-namestring specified-pathname)
-                                :if-does-not-exist nil)
-          (if stream
-              (load-as-source stream :context context)
-              (cerror "Ignore missing init file"
-                      "The specified ~A file ~A was not found."
-                      context specified-pathname)))
-        (let ((default (funcall default-function)))
-          (when default
-            (with-open-file (stream (pathname default) :if-does-not-exist nil)
-              (when stream
-                (load-as-source stream :context context))))))))
 
 (defun process-eval/load-options (options)
   (/show0 "handling --eval and --load options")
@@ -469,11 +475,24 @@ any non-negative real number."
       ;; helpful to let the user reach the REPL in order to help
       ;; figure out what's going on.)
       (restart-case
-          (progn
+          (flet ((process-init-file (kind specified-pathname default-function)
+                   (awhen (or specified-pathname (funcall default-function))
+                     (with-open-file (stream (if specified-pathname
+                                                 (parse-native-namestring it)
+                                                 (pathname it))
+                                             :if-does-not-exist nil)
+                       (cond (stream
+                              (dx-flet ((thunk ()
+                                          (load-as-source stream :context kind)))
+                                (sb!fasl::call-with-load-bindings #'thunk stream)))
+                             (specified-pathname
+                              (cerror "Ignore missing init file"
+                                      "The specified ~A file ~A was not found."
+                                      kind specified-pathname)))))))
             (unless no-sysinit
-              (process-init-file sysinit :system))
+              (process-init-file "sysinit" sysinit *sysinit-pathname-function*))
             (unless no-userinit
-              (process-init-file userinit :user))
+              (process-init-file "userinit" userinit *userinit-pathname-function*))
             (when finally-quit
               (push (list :quit) reversed-options))
             (process-eval/load-options (nreverse reversed-options))
@@ -510,20 +529,46 @@ any non-negative real number."
 ;;; KMR on sbcl-devel 2002-12-21.  Altered by CSR 2003-11-16 for
 ;;; threaded operation: altered *REPL-FUN* to *REPL-FUN-GENERATOR*.
 (defvar *repl-read-form-fun* #'repl-read-form-fun
-  #!+sb-doc
   "A function of two stream arguments IN and OUT for the toplevel REPL to
 call: Return the next Lisp form to evaluate (possibly handling other magic --
 like ACL-style keyword commands -- which precede the next Lisp form). The OUT
 stream is there to support magic which requires issuing new prompts.")
 (defvar *repl-prompt-fun* #'repl-prompt-fun
-  #!+sb-doc
   "A function of one argument STREAM for the toplevel REPL to call: Prompt
 the user for input.")
 (defvar *repl-fun-generator* (constantly #'repl-fun)
-  #!+sb-doc
   "A function of no arguments returning a function of one argument NOPRINT
 that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
 *STANDARD-OUTPUT* are set up.")
+
+;;; toplevel helper
+(defmacro with-rebound-io-syntax (&body body)
+  `(%with-rebound-io-syntax (lambda () ,@body)))
+
+(defun %with-rebound-io-syntax (function)
+  (declare (type function function))
+  (declare (dynamic-extent function))
+  (let ((*package* *package*)
+        (*print-array* *print-array*)
+        (*print-base* *print-base*)
+        (*print-case* *print-case*)
+        (*print-circle* *print-circle*)
+        (*print-escape* *print-escape*)
+        (*print-gensym* *print-gensym*)
+        (*print-length* *print-length*)
+        (*print-level* *print-level*)
+        (*print-lines* *print-lines*)
+        (*print-miser-width* *print-miser-width*)
+        (*print-pretty* *print-pretty*)
+        (*print-radix* *print-radix*)
+        (*print-readably* *print-readably*)
+        (*print-right-margin* *print-right-margin*)
+        (*read-base* *read-base*)
+        (*read-default-float-format* *read-default-float-format*)
+        (*read-eval* *read-eval*)
+        (*read-suppress* *read-suppress*)
+        (*readtable* *readtable*))
+    (funcall function)))
 
 ;;; read-eval-print loop for the default system toplevel
 (defun toplevel-repl (noprint)
@@ -579,7 +624,6 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
   (loop
    (unwind-protect
         (progn
-          ;; (See comment preceding the definition of SCRUB-CONTROL-STACK.)
           (scrub-control-stack)
           (sb!thread::get-foreground)
           (unless noprint

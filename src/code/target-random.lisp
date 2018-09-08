@@ -86,7 +86,6 @@
 ;;; A: Because the DEFKNOWN for MAKE-RANDOM-STATE is more restricted
 ;;;    and doesn't accept numerical state.
 (defun make-random-state (&optional state)
-  #!+sb-doc
   "Make a random state object. The optional STATE argument specifies a seed
 for deterministic pseudo-random number generation.
 
@@ -122,7 +121,7 @@ See SB-EXT:SEED-RANDOM-STATE for a SBCL extension to this functionality."
     (with-open-file (r "/dev/urandom" :element-type '(unsigned-byte 32)
                                       :direction :input :if-does-not-exist :error)
       (let ((a (make-array '(8) :element-type '(unsigned-byte 32))))
-        (assert (= 8 (read-sequence a r)))
+        (aver (= 8 (read-sequence a r)))
         a)))
    (fallback-random-seed)))
 
@@ -133,7 +132,6 @@ See SB-EXT:SEED-RANDOM-STATE for a SBCL extension to this functionality."
       (fallback-random-seed)))
 
 (defun seed-random-state (&optional state)
-  #!+sb-doc
   "Make a random state object. The optional STATE argument specifies a seed
 for deterministic pseudo-random number generation.
 
@@ -399,7 +397,7 @@ http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/emt.html
                         (let ((bits (logand mask (,generator state))))
                           (when (< bits arg)
                             (return bits))))))
-          (assert (<= n-bits (* 2 n-random-chunk-bits)))
+          (aver (<= n-bits (* 2 n-random-chunk-bits)))
           (if (<= n-bits n-random-chunk-bits)
               (accept-reject-loop random-chunk)
               (accept-reject-loop big-random-chunk))))))

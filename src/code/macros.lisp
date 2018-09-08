@@ -27,7 +27,6 @@
 ;;;
 (sb!xc:defmacro assert (test-form &optional places datum &rest arguments
                             &environment env)
-  #!+sb-doc
   "Signals an error if the value of TEST-FORM is NIL. Returns NIL.
 
    Optional DATUM and ARGUMENTS can be used to change the signaled
@@ -116,7 +115,6 @@
 ;;; the macro RESTART-CASE, which isn't defined until a later file.
 (sb!xc:defmacro check-type (place type &optional type-string
                                 &environment env)
-  #!+sb-doc
   "Signal a restartable error of type TYPE-ERROR if the value of PLACE
 is not of the specified type. If an error is signalled and the restart
 is used to return, this can only return if the STORE-VALUE restart is
@@ -126,7 +124,7 @@ invoked. In that case it will store into PLACE and start over."
     (error 'simple-reference-error
            :format-control "Quoted type specifier in ~S: ~S"
            :format-arguments (list 'check-type type)
-           :references (list '(:ansi-cl :macro check-type))))
+           :references '((:ansi-cl :macro check-type))))
   ;; KLUDGE: We use a simpler form of expansion if PLACE is just a
   ;; variable to work around Python's blind spot in type derivation.
   ;; For more complex places getting the type derived should not
@@ -167,27 +165,23 @@ invoked. In that case it will store into PLACE and start over."
       (setf (info :variable :kind name) :macro)
       (setf (info :variable :macro-expansion name) expansion))
      (t
-      (error 'simple-program-error
-             :format-control "Symbol ~S is already defined as ~A."
-             :format-arguments (list name
-                                     (case kind
-                                       (:alien "an alien variable")
-                                       (:constant "a constant")
-                                       (:special "a special variable")
-                                       (:global "a global variable")
-                                       (t kind)))))))
+      (%program-error "Symbol ~S is already defined as ~A."
+                      name (case kind
+                             (:alien "an alien variable")
+                             (:constant "a constant")
+                             (:special "a special variable")
+                             (:global "a global variable")
+                             (t kind))))))
   name)
 
 ;;;; DEFINE-COMPILER-MACRO
 
 (sb!xc:defmacro define-compiler-macro (name lambda-list &body body)
-  #!+sb-doc
   "Define a compiler-macro for NAME."
   (legal-fun-name-or-type-error name)
   (when (and (symbolp name) (special-operator-p name))
-    (error 'simple-program-error
-           :format-control "cannot define a compiler-macro for a special operator: ~S"
-           :format-arguments (list name)))
+    (%program-error "cannot define a compiler-macro for a special operator: ~S"
+                    name))
   ;; DEBUG-NAME is called primarily for its side-effect of asserting
   ;; that (COMPILER-MACRO-FUNCTION x) is not a legal function name.
   (let ((def (make-macro-lambda (sb!c::debug-name 'compiler-macro name)
@@ -195,7 +189,7 @@ invoked. In that case it will store into PLACE and start over."
                                 :accessor 'sb!c::compiler-macro-args)))
     `(progn
           (eval-when (:compile-toplevel)
-           (sb!c::%compiler-defmacro :compiler-macro-function ',name t))
+           (sb!c::%compiler-defmacro :compiler-macro-function ',name))
           (eval-when (:compile-toplevel :load-toplevel :execute)
            (sb!c::%define-compiler-macro ',name ,def)))))
 
@@ -312,7 +306,7 @@ invoked. In that case it will store into PLACE and start over."
                             :format-control
                             "~@<~IBad ~S clause:~:@_  ~S~:@_~S allowed as the key ~
                            designator only in the final otherwise-clause, not in a ~
-                           normal-clause. Use (~S) instead, or move the clause the ~
+                           normal-clause. Use (~S) instead, or move the clause to the ~
                            correct position.~:@>"
                             :format-arguments (list 'case case keyoid keyoid)
                             :references `((:ansi-cl :macro case))))
@@ -371,14 +365,12 @@ invoked. In that case it will store into PLACE and start over."
 ) ; EVAL-WHEN
 
 (sb!xc:defmacro case (keyform &body cases)
-  #!+sb-doc
   "CASE Keyform {({(Key*) | Key} Form*)}*
   Evaluates the Forms in the first clause with a Key EQL to the value of
   Keyform. If a singleton key is T then the clause is a default clause."
   (case-body 'case keyform cases t 'eql nil nil nil))
 
 (sb!xc:defmacro ccase (keyform &body cases)
-  #!+sb-doc
   "CCASE Keyform {({(Key*) | Key} Form*)}*
   Evaluates the Forms in the first clause with a Key EQL to the value of
   Keyform. If none of the keys matches then a correctable error is
@@ -386,28 +378,24 @@ invoked. In that case it will store into PLACE and start over."
   (case-body 'ccase keyform cases t 'eql t t t))
 
 (sb!xc:defmacro ecase (keyform &body cases)
-  #!+sb-doc
   "ECASE Keyform {({(Key*) | Key} Form*)}*
   Evaluates the Forms in the first clause with a Key EQL to the value of
   Keyform. If none of the keys matches then an error is signalled."
   (case-body 'ecase keyform cases t 'eql t nil t))
 
 (sb!xc:defmacro typecase (keyform &body cases)
-  #!+sb-doc
   "TYPECASE Keyform {(Type Form*)}*
   Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
   is true."
   (case-body 'typecase keyform cases nil 'typep nil nil nil))
 
 (sb!xc:defmacro ctypecase (keyform &body cases)
-  #!+sb-doc
   "CTYPECASE Keyform {(Type Form*)}*
   Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
   is true. If no form is satisfied then a correctable error is signalled."
   (case-body 'ctypecase keyform cases nil 'typep t t t))
 
 (sb!xc:defmacro etypecase (keyform &body cases)
-  #!+sb-doc
   "ETYPECASE Keyform {(Type Form*)}*
   Evaluates the Forms in the first clause for which TYPEP of Keyform and Type
   is true. If no form is satisfied then an error is signalled."
@@ -501,7 +489,6 @@ invoked. In that case it will store into PLACE and start over."
 ;;;; miscellaneous macros
 
 (sb!xc:defmacro nth-value (n form &environment env)
-  #!+sb-doc
   "Evaluate FORM and return the Nth value (zero based)
  without consing a temporary list of values."
   ;; FIXME: The above is true, if slightly misleading.  The
@@ -512,7 +499,9 @@ invoked. In that case it will store into PLACE and start over."
   ;; optional dispatch mechanism for the M-V-B gets increasingly
   ;; hairy.
   (let ((val (and (sb!xc:constantp n env) (constant-form-value n env))))
-    (if (and (integerp val) (<= 0 val 10)) ; Arbitrary limit.
+    (if (and (integerp val) (<= 0 val (or #!+(or x86-64 arm64) ;; better DEFAULT-UNKNOWN-VALUES
+                                          1000
+                                          10))) ; Arbitrary limit.
         (let ((dummy-list (make-gensym-list val))
               (keeper (sb!xc:gensym "KEEPER")))
           `(multiple-value-bind (,@dummy-list ,keeper) ,form
@@ -527,7 +516,6 @@ invoked. In that case it will store into PLACE and start over."
            (the index ,n) ,form))))
 
 (sb!xc:defmacro declaim (&rest specs)
-  #!+sb-doc
   "DECLAIM Declaration*
   Do a declaration or declarations for the global environment."
   `(eval-when (:compile-toplevel :load-toplevel :execute)
@@ -540,7 +528,6 @@ invoked. In that case it will store into PLACE and start over."
                 %print-unreadable-object))
 (sb!xc:defmacro print-unreadable-object ((object stream &key type identity)
                                              &body body)
-  #!+sb-doc
   "Output OBJECT to STREAM with \"#<\" prefix, \">\" suffix, optionally
   with object-type prefix and object-identity suffix, and executing the
   code in BODY to provide possible further output."
@@ -552,7 +539,6 @@ invoked. In that case it will store into PLACE and start over."
         call)))
 
 (sb!xc:defmacro ignore-errors (&rest forms)
-  #!+sb-doc
   "Execute FORMS handling ERROR conditions, returning the result of the last
   form, or (VALUES NIL the-ERROR-that-was-caught) if an ERROR was handled."
   `(handler-case (progn ,@forms)
@@ -568,3 +554,28 @@ invoked. In that case it will store into PLACE and start over."
     (let ((fn-sym (sb!xc:gensym))) ; for ONCE-ONLY-ish purposes
       (values `((,fn-sym (%coerce-callable-to-fun ,funarg)))
               `(sb!c::%funcall ,fn-sym . ,arg-forms)))))
+
+;;; Ordinarily during self-build, nothing would need this macro except the
+;;; calls in src/code/list, and src/code/seq.
+;;; However, if cons profiling is enbled, then all calls to COPY-LIST
+;;; transform into the macro, so it must be available early.
+(sb!xc:defmacro copy-list-macro (input &key check-proper-list)
+  ;; Unless CHECK-PROPER-LIST is true, the list is copied correctly
+  ;; even if the list is not terminated by NIL. The new list is built
+  ;; by CDR'ing SPLICE which is always at the tail of the new list.
+  (with-unique-names (orig copy splice cell)
+    ;; source transform gave input the ONCE-ONLY treatment already.
+    `(when ,input
+       (let ((,copy (list (car ,input))))
+         (do ((,orig (cdr ,input) (cdr ,orig))
+              (,splice ,copy
+                       (let ((,cell (list (car ,orig))))
+                         (rplacd (truly-the cons ,splice) ,cell)
+                         ,cell)))
+           (,@(if check-proper-list
+                  `((endp ,orig))
+                  `((atom ,orig)
+                    ;; always store the CDR even if NIL. A blind write
+                    ;; is cheaper than a branch around a write.
+                    (rplacd (truly-the cons ,splice) ,orig)))
+            ,copy))))))

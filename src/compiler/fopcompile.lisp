@@ -68,7 +68,9 @@
   ;; executing all other toplevel forms.
   (flet ((expand (form)
            (if expand
-               (%macroexpand form *lexenv*)
+               (handler-case
+                   (%macroexpand form *lexenv*)
+                 (error () (return-from fopcompilable-p)))
                (values form nil)))
          (expand-cm (form)
            (if expand
@@ -209,9 +211,11 @@
                                   (integerp index)
                                   (eq (info :variable :kind thing) :global)
                                   (typep value '(cons (member lambda function
-                                                              named-lambda))))))
+                                                       named-lambda))))))
                       (and (eq function 'setq)
-                           (setq-fopcompilable-p (cdr form))))))))))
+                           (setq-fopcompilable-p (cdr form)))
+
+                      (eq function 'sb!fasl::setq-no-questions-asked))))))))
 
 (defun let-fopcompilable-p (operator args)
   (when (>= (length args) 1)
@@ -401,7 +405,7 @@
                            (loop for (arg . next) on args
                              do (fopcompile arg path
                                             (if next nil for-value-p)))))
-                      ((setq)
+                      ((setq #+sb-xc-host sb!fasl::setq-no-questions-asked)
                        (if (and for-value-p (endp args))
                            (fopcompile nil path t)
                            (loop for (name value . next) on args by #'cddr
@@ -444,8 +448,9 @@
                                   (file-info (source-info-file-info *source-info*))
                                   (*compiler-error-context*
                                     (make-compiler-error-context
-                                     :original-source (stringify-form form)
+                                     :original-form form
                                      :file-name (file-info-name file-info)
+                                     :initialized t
                                      :file-position
                                      (nth-value 1 (find-source-root tlf *source-info*))
                                      :original-source-path (source-path-original-source path)
@@ -460,8 +465,7 @@
                          ;; other operations, but I don't see any good
                          ;; candidates in a quick read-through of
                          ;; src/code/fop.lisp.)
-                         ((and (eq operator
-                                   'sb!int:find-undeleted-package-or-lose)
+                         ((and (eq operator 'find-undeleted-package-or-lose)
                                (= 1 (length args))
                                for-value-p)
                           (fopcompile (first args) path t)

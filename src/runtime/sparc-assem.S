@@ -1,3 +1,8 @@
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #define _ASM
 
 #include "sparc-funcdef.h"
@@ -44,7 +49,7 @@ call_into_lisp:
         mov     reg_ZERO, reg_CODE
 
         /* Establish NIL */
-        set     NIL, reg_NIL
+        set     NIL, reg_NULL
 
 	/* Set the pseudo-atomic flag. */
 	set	4, reg_ALLOC
@@ -87,7 +92,7 @@ call_into_lisp:
 
         .align  8
 lra:
-        .word   RETURN_PC_HEADER_WIDETAG
+        .word   RETURN_PC_WIDETAG
 
         /* Blow off any extra values. */
         mov     reg_OCFP, reg_CSP
@@ -165,7 +170,7 @@ call_into_c:
 	 */
 	
         /* Re-establish NIL */
-        set     NIL, reg_NIL
+        set     NIL, reg_NULL
 
 	/* Atomic. */
 	set	4, reg_ALLOC
@@ -214,17 +219,17 @@ call_into_c:
 	.align	8
 	.global	fun_end_breakpoint_guts
 fun_end_breakpoint_guts:
-	.word	RETURN_PC_HEADER_WIDETAG + 0x600
+	.word	RETURN_PC_WIDETAG + 0x600
 	b	1f
 	nop
 	mov	reg_CSP, reg_OCFP
 	add	4, reg_CSP, reg_CSP
 	mov	4, reg_NARGS
-	mov	reg_NIL, reg_A1
-	mov	reg_NIL, reg_A2
-	mov	reg_NIL, reg_A3
-	mov	reg_NIL, reg_A4
-	mov	reg_NIL, reg_A5
+	mov	reg_NULL, reg_A1
+	mov	reg_NULL, reg_A2
+	mov	reg_NULL, reg_A3
+	mov	reg_NULL, reg_A4
+	mov	reg_NULL, reg_A5
 1:
 
 	.global	fun_end_breakpoint_trap

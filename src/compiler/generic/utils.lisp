@@ -32,12 +32,12 @@
 
 (defun static-symbol-p (symbol)
   (or (null symbol)
-      (and (member symbol *static-symbols*) t)))
+      (and (find symbol +static-symbols+) t)))
 
 ;;; the byte offset of the static symbol SYMBOL
 (defun static-symbol-offset (symbol)
   (if symbol
-      (let ((posn (position symbol *static-symbols*)))
+      (let ((posn (position symbol +static-symbols+)))
         (unless posn (error "~S is not a static symbol." symbol))
         (+ (* posn (pad-data-block symbol-size))
            (pad-data-block (1- symbol-size))
@@ -45,30 +45,26 @@
            (- list-pointer-lowtag)))
       0))
 
-;;; Given a byte offset, OFFSET, return the appropriate static symbol.
-(defun offset-static-symbol (offset)
-  (if (zerop offset)
-      nil
-      (multiple-value-bind (n rem)
-          (truncate (+ offset list-pointer-lowtag (- other-pointer-lowtag)
-                       (- (pad-data-block (1- symbol-size))))
-                    (pad-data-block symbol-size))
-        (unless (and (zerop rem) (<= 0 n (1- (length *static-symbols*))))
-          (error "The byte offset ~W is not valid." offset))
-        (elt *static-symbols* n))))
+(defconstant-eqx +all-static-fdefns+
+    #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+) #'equalp)
 
 ;;; Return the (byte) offset from NIL to the start of the fdefn object
 ;;; for the static function NAME.
 (defun static-fdefn-offset (name)
-  (let ((static-syms (length *static-symbols*))
-        (static-fun-index (position name *static-funs*)))
-    (unless static-fun-index
-      (error "~S isn't a static function." name))
-    (+ (* static-syms (pad-data-block symbol-size))
-       (pad-data-block (1- symbol-size))
-       (- list-pointer-lowtag)
-       (* static-fun-index (pad-data-block fdefn-size))
-       other-pointer-lowtag)))
+  (let ((static-fun-index (position name +all-static-fdefns+)))
+    (and static-fun-index
+         (+ (* (length +static-symbols+) (pad-data-block symbol-size))
+            (pad-data-block (1- symbol-size))
+            (- list-pointer-lowtag)
+            (* static-fun-index (pad-data-block fdefn-size))
+            other-pointer-lowtag))))
+
+;;; Return absolute address of the 'fun' slot in static fdefn NAME.
+(defun static-fdefn-fun-addr (name)
+  (+ nil-value
+     (static-fdefn-offset name)
+     (- other-pointer-lowtag)
+     (ash fdefn-fun-slot word-shift)))
 
 ;;; Return the (byte) offset from NIL to the raw-addr slot of the
 ;;; fdefn object for the static function NAME.
@@ -77,26 +73,6 @@
      (- other-pointer-lowtag)
      (* fdefn-raw-addr-slot n-word-bytes)))
 
-;;; Various error-code generating helpers
-(defvar *adjustable-vectors* nil)
-
-(defmacro with-adjustable-vector ((var) &rest body)
-  `(let ((,var (or (pop *adjustable-vectors*)
-                   (make-array 16
-                               :element-type '(unsigned-byte 8)
-                               :fill-pointer 0
-                               :adjustable t))))
-     ;; Don't declare the length - if it gets adjusted and pushed back
-     ;; onto the freelist, it's anyone's guess whether it was expanded.
-     ;; This code was wrong for >12 years, so nobody must have needed
-     ;; more than 16 elements. Maybe we should make it nonadjustable?
-     (declare (type (vector (unsigned-byte 8)) ,var))
-     (setf (fill-pointer ,var) 0)
-     (unwind-protect
-         (progn
-           ,@body)
-       (push ,var *adjustable-vectors*))))
-
 ;;;; interfaces to IR2 conversion
 
 ;;; Return a wired TN describing the N'th full call argument passing
@@ -108,12 +84,23 @@
                      (nth n *register-arg-offsets*))
       (make-wired-tn *backend-t-primitive-type* control-stack-sc-number n)))
 
+;;; Same as above but marks stack locations as :arg-pass
+(defun standard-call-arg-location (n)
+  (declare (type unsigned-byte n))
+  (if (< n register-arg-count)
+      (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number
+                     (nth n *register-arg-offsets*))
+      (let ((tn
+              (make-wired-tn *backend-t-primitive-type* control-stack-sc-number n)))
+        (setf (tn-kind tn) :arg-pass)
+        tn)))
+
 (defun standard-arg-location-sc (n)
   (declare (type unsigned-byte n))
   (if (< n register-arg-count)
-      (make-sc-offset descriptor-reg-sc-number
+      (make-sc+offset descriptor-reg-sc-number
                       (nth n *register-arg-offsets*))
-      (make-sc-offset control-stack-sc-number n)))
+      (make-sc+offset control-stack-sc-number n)))
 
 ;;; Make a TN to hold the number-stack frame pointer.  This is allocated
 ;;; once per component, and is component-live.
@@ -130,7 +117,9 @@
    (make-representation-tn *fixnum-primitive-type* any-reg-sc-number)
    env))
 
-(defun make-stack-pointer-tn ()
+#!-x86-64
+(defun make-stack-pointer-tn (&optional nargs)
+  (declare (ignore nargs))
   (make-normal-tn *fixnum-primitive-type*))
 
 (defun make-number-stack-pointer-tn ()
@@ -141,9 +130,14 @@
 
 ;;; Return a list of TNs that can be used to represent an unknown-values
 ;;; continuation within a function.
-(defun make-unknown-values-locations ()
+(defun make-unknown-values-locations (&optional unused-count)
+  (declare (ignorable unused-count))
   (list (make-stack-pointer-tn)
-        (make-normal-tn *fixnum-primitive-type*)))
+        (cond #!+x86-64 ;; needs support from receive-unknown-values
+              (unused-count
+               (sb!c::make-unused-tn))
+              (t
+               (make-normal-tn *fixnum-primitive-type*)))))
 
 ;;; This function is called by the ENTRY-ANALYZE phase, allowing
 ;;; VM-dependent initialization of the IR2-COMPONENT structure. We
@@ -151,19 +145,34 @@
 ;;; additional noise in the code object header.
 (defun select-component-format (component)
   (declare (type component component))
-  ;; The 1+ here is because for the x86 the first constant is a
-  ;; pointer to a list of fixups, or NIL if the code object has none.
-  ;; (The fixups are needed at GC copy time because the X86 code isn't
-  ;; relocatable.)
-  ;;
-  ;; KLUDGE: It'd be cleaner to have the fixups entry be a named
-  ;; element of the CODE (aka component) primitive object. However,
-  ;; it's currently a large, tricky, error-prone chore to change
-  ;; the layout of any primitive object, so for the foreseeable future
-  ;; we'll just live with this ugliness. -- WHN 2002-01-02
-  (dotimes (i (+ code-constants-offset #!+x86 1))
+  (dotimes (i code-constants-offset)
     (vector-push-extend nil
                         (ir2-component-constants (component-info component))))
   (values))
 
+(defun error-call (vop error-code &rest values)
+  "Cause an error.  ERROR-CODE is the error to cause."
+  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
 
+(defun cerror-call (vop error-code &rest values)
+  "Cause a continuable error.  ERROR-CODE is the error to cause."
+  (emit-error-break vop cerror-trap (error-number-or-lose error-code) values))
+
+#!+sb-safepoint
+(define-vop (insert-safepoint)
+  (:policy :fast-safe)
+  (:translate sb!kernel::gc-safepoint)
+  (:generator 0
+    (emit-safepoint)))
+
+(defun other-pointer-tn-ref-p (tn-ref)
+  (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
+       (tn-ref-type tn-ref)
+       (not (types-equal-or-intersect
+             (tn-ref-type tn-ref)
+             (specifier-type '(or fixnum
+                               #!+64-bit single-float
+                               function
+                               list
+                               instance
+                               character))))))

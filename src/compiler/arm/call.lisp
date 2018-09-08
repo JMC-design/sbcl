@@ -11,8 +11,8 @@
 
 (in-package "SB!VM")
 
-(defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Always wire the return PC location to the stack in its standard
 ;;; location.
@@ -22,7 +22,7 @@
                  lra-save-offset))
 
 (defconstant return-pc-passing-offset
-  (make-sc-offset control-stack-sc-number lra-save-offset))
+  (make-sc+offset control-stack-sc-number lra-save-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in.
@@ -31,13 +31,12 @@
 ;;; because we want to be able to assume it's always there. Besides,
 ;;; the ARM doesn't have enough registers to really make it profitable
 ;;; to pass it in a register.
-(defun make-old-fp-passing-location (standard)
-  (declare (ignore standard))
+(defun make-old-fp-passing-location ()
   (make-wired-tn *fixnum-primitive-type* control-stack-sc-number
                  ocfp-save-offset))
 
 (defconstant old-fp-passing-offset
-  (make-sc-offset control-stack-sc-number ocfp-save-offset))
+  (make-sc+offset control-stack-sc-number ocfp-save-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -124,8 +123,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst word 0))
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     (inst compute-code code-tn lip start-lab temp)))
 
 (define-vop (xep-setup-sp)
@@ -775,10 +773,12 @@
      (:args
       ,@(unless (eq return :tail)
           '((new-fp :scs (any-reg) :to :eval)))
-
-      ,(if named
-           '(name :target name-pass)
-           '(arg-fun :target lexenv))
+      ,@(case named
+         ((nil)
+          '((arg-fun :target lexenv)))
+         (:direct)
+         (t
+          '((name :target name-pass))))
 
       ,@(when (eq return :tail)
           '((old-fp)
@@ -797,6 +797,7 @@
      (:vop-var vop)
      (:info ,@(unless (or variable (eq return :tail)) '(arg-locs))
             ,@(unless variable '(nargs))
+            ,@(when (eq named :direct) '(fun))
             ,@(when (eq return :fixed) '(nvals))
             step-instrumenting)
 
@@ -806,10 +807,11 @@
       ,@(unless variable '(args))
       ,@(when (eq return :tail) '(old-fp)))
 
-     (:temporary (:sc descriptor-reg :offset lexenv-offset
-                      :from (:argument ,(if (eq return :tail) 0 1))
-                      :to :eval)
-                 ,(if named 'name-pass 'lexenv))
+     ,@(unless (eq named :direct)
+         `((:temporary (:sc descriptor-reg :offset lexenv-offset
+                        :from (:argument ,(if (eq return :tail) 0 1))
+                        :to :eval)
+                       ,(if named 'name-pass 'lexenv))))
 
      (:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
                  function)
@@ -920,33 +922,36 @@
                       (emit-alignment word-shift)
 
                       STEP-DONE-LABEL))))
-
-
-           ,@(if named
-                 `((sc-case name
-                     (descriptor-reg (move name-pass name))
-                     (control-stack
-                      (load-stack-tn name-pass name)
-                      (do-next-filler))
-                     (constant
-                      (load-constant vop name name-pass)
-                      (do-next-filler)))
-                   (insert-step-instrumenting name-pass)
-                   (loadw function name-pass fdefn-raw-addr-slot
-                          other-pointer-lowtag)
-                   (do-next-filler))
-                 `((sc-case arg-fun
-                     (descriptor-reg (move lexenv arg-fun))
-                     (control-stack
-                      (load-stack-tn lexenv arg-fun)
-                      (do-next-filler))
-                     (constant
-                      (load-constant vop arg-fun lexenv)
-                      (do-next-filler)))
-                   (loadw function lexenv closure-fun-slot
-                          fun-pointer-lowtag)
-                   (do-next-filler)
-                   (insert-step-instrumenting function)))
+           (declare (ignorable #'insert-step-instrumenting))
+           ,@(case named
+               ((t)
+                `((sc-case name
+                    (descriptor-reg (move name-pass name))
+                    (control-stack
+                     (load-stack-tn name-pass name)
+                     (do-next-filler))
+                    (constant
+                     (load-constant vop name name-pass)
+                     (do-next-filler)))
+                  (insert-step-instrumenting name-pass)
+                  (loadw function name-pass fdefn-raw-addr-slot
+                      other-pointer-lowtag)
+                  (do-next-filler)))
+               ((nil)
+                `((sc-case arg-fun
+                    (descriptor-reg (move lexenv arg-fun))
+                    (control-stack
+                     (load-stack-tn lexenv arg-fun)
+                     (do-next-filler))
+                    (constant
+                     (load-constant vop arg-fun lexenv)
+                     (do-next-filler)))
+                  (loadw function lexenv closure-fun-slot
+                      fun-pointer-lowtag)
+                  (do-next-filler)
+                  (insert-step-instrumenting function)))
+               (:direct
+                `((inst ldr function (@ null-tn (static-fun-offset fun))))))
            (loop
              (if filler
                  (do-next-filler)
@@ -973,10 +978,13 @@
 
 (define-full-call call nil :fixed nil)
 (define-full-call call-named t :fixed nil)
+(define-full-call static-call-named :direct :fixed nil)
 (define-full-call multiple-call nil :unknown nil)
 (define-full-call multiple-call-named t :unknown nil)
+(define-full-call static-multiple-call-named :direct :unknown nil)
 (define-full-call tail-call nil :tail nil)
 (define-full-call tail-call-named t :tail nil)
+(define-full-call static-tail-call-named :direct :tail nil)
 
 (define-full-call call-variable nil :fixed t)
 (define-full-call multiple-call-variable nil :unknown t)
@@ -1004,7 +1012,7 @@
         (inst add cur-nfp cur-nfp (bytes-needed-for-non-descriptor-stack-frame))
         (move nsp-tn cur-nfp)))
     (let ((fixup-lab (gen-label)))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label fixup-lab)
         (inst word (make-fixup 'tail-call-variable :assembly-routine)))
       (inst load-from-label pc-tn lip fixup-lab))))

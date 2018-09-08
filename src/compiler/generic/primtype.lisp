@@ -48,7 +48,7 @@
 (!def-primitive-type signed-byte-64 (signed-reg descriptor-reg)
   :type (signed-byte 64))
 
-(defvar *fixnum-primitive-type* (primitive-type-or-lose 'fixnum))
+(define-load-time-global *fixnum-primitive-type* (primitive-type-or-lose 'fixnum))
 
 (/show0 "primtype.lisp 53")
 (!def-primitive-type-alias tagged-num '(:or positive-fixnum fixnum))
@@ -332,6 +332,9 @@
            ;; primitive type.  (And NIL is the conservative answer,
            ;; anyway).  -- CSR, 2006-09-14
            (dolist (type types (values res nil))
+             (when (csubtypep type (specifier-type 'function))
+               ;; Things like (AND STANDARD-OBJECT FUNCTION) are callable as functions.
+               (part-of function))
              (multiple-value-bind (ptype)
                  (primitive-type type)
                (cond
@@ -396,6 +399,8 @@
             (part-of list))
            (t
             (any))))
+        (fun-designator-type
+         (any))
         (fun-type
          (exactly function))
         (classoid

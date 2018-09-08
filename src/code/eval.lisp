@@ -54,8 +54,8 @@
                              ;; anyone caring about performance should not
                              ;; be using EVAL.
                              (compiler-note #'muffle-warning))
-                (sb!c:compile-in-lexenv
-                 nil lambda lexenv *eval-source-info* *eval-tlf-index* (not call))))))
+                (sb!c:compile-in-lexenv lambda lexenv nil *eval-source-info*
+                                        *eval-tlf-index* (not call))))))
       (declare (function fun))
       (if call
           (funcall fun)
@@ -64,13 +64,16 @@
 ;;; Handle PROGN and implicit PROGN.
 #!-sb-fasteval
 (progn
+(defun list-with-length-p (x)
+  ;; Is X a list for which LENGTH is meaningful, i.e. a list which is
+  ;; not improper and which is not circular?
+  (values (ignore-errors (list-length x))))
 (defun simple-eval-progn-body (progn-body lexenv)
   (unless (list-with-length-p progn-body)
     (let ((*print-circle* t))
-      (error 'simple-program-error
-             :format-control
-             "~@<not a proper list in PROGN or implicit PROGN: ~2I~_~S~:>"
-             :format-arguments (list progn-body))))
+      (%program-error "~@<not a proper list in PROGN or implicit PROGN: ~
+                       ~2I~_~S~:>"
+                      progn-body)))
   ;; Note:
   ;;   * We can't just use (MAP NIL #'EVAL PROGN-BODY) here, because we
   ;;     need to take care to return all the values of the final EVAL.
@@ -84,8 +87,8 @@
         (simple-eval-in-lexenv (first i) lexenv)
         (return (simple-eval-in-lexenv (first i) lexenv)))))
 
-(defun simple-eval-locally (exp lexenv &key vars)
-  (multiple-value-bind (body decls) (parse-body (rest exp) nil)
+(defun simple-eval-locally (exp lexenv &key vars funs)
+  (multiple-value-bind (body decls) (parse-body exp nil)
     (let ((lexenv
            ;; KLUDGE: Uh, yeah.  I'm not anticipating
            ;; winning any prizes for this code, which was
@@ -106,7 +109,7 @@
              ;; FIXME: VALUES declaration
              (sb!c::process-decls decls
                                   vars
-                                  nil
+                                  funs
                                   :lexenv lexenv
                                   :context :eval))))
       (simple-eval-progn-body body lexenv))))
@@ -229,29 +232,25 @@
                     (when e
                       (simple-eval-progn-body body lexenv)))))
                ((locally)
-                (simple-eval-locally exp lexenv))
+                (simple-eval-locally (rest exp) lexenv))
                ((macrolet)
-                (destructuring-bind (definitions &rest body)
-                    (rest exp)
-                  (let ((lexenv
-                          (let ((sb!c:*lexenv* lexenv))
-                            (sb!c::funcall-in-macrolet-lexenv
-                             definitions
-                             (lambda (&key funs)
-                               (declare (ignore funs))
-                               sb!c:*lexenv*)
-                             :eval))))
-                    (simple-eval-locally `(locally ,@body) lexenv))))
+                (destructuring-bind (definitions &rest body) (rest exp)
+                  (let ((sb!c:*lexenv* lexenv))
+                    (sb!c::funcall-in-macrolet-lexenv
+                     definitions
+                     (lambda (&optional funs)
+                       (simple-eval-locally body sb!c:*lexenv*
+                                            :funs funs))
+                     :eval))))
                ((symbol-macrolet)
                 (destructuring-bind (definitions &rest body) (rest exp)
-                  (multiple-value-bind (lexenv vars)
-                      (let ((sb!c:*lexenv* lexenv))
-                        (sb!c::funcall-in-symbol-macrolet-lexenv
-                         definitions
-                         (lambda (&key vars)
-                           (values sb!c:*lexenv* vars))
-                         :eval))
-                    (simple-eval-locally `(locally ,@body) lexenv :vars vars))))
+                  (let ((sb!c:*lexenv* lexenv))
+                    (sb!c::funcall-in-symbol-macrolet-lexenv
+                     definitions
+                     (lambda (&optional vars)
+                       (simple-eval-locally body sb!c:*lexenv*
+                                            :vars vars))
+                     :eval))))
                ((if)
                 (destructuring-bind (test then &optional else) (rest exp)
                   (eval-in-lexenv (if (eval-in-lexenv test lexenv)
@@ -293,7 +292,6 @@
   (simple-eval-in-lexenv exp (or lexenv (make-null-lexenv))))
 
 (defun eval (original-exp)
-  #!+sb-doc
   "Evaluate the argument in a null lexical environment, returning the
    result or results."
   (let ((*eval-source-context* original-exp)
@@ -311,7 +309,6 @@
 ;;; ordinarily handled magically by the compiler
 
 (defun apply (function arg &rest arguments)
-  #!+sb-doc
   "Apply FUNCTION to a list of arguments produced by evaluating ARGUMENTS in
   the manner of LIST*. That is, a list is made of the values of all but the
   last argument, appended to the value of the last argument, which must be a
@@ -327,17 +324,14 @@
                  (apply function (cons arg arguments)))))))
 
 (defun funcall (function &rest arguments)
-  #!+sb-doc
   "Call FUNCTION with the given ARGUMENTS."
   (apply function arguments))
 
 (defun values (&rest values)
-  #!+sb-doc
   "Return all arguments, in order, as values."
   (declare (truly-dynamic-extent values))
   (values-list values))
 
 (defun values-list (list)
-  #!+sb-doc
   "Return all of the elements of LIST, in order, as values."
   (values-list list))

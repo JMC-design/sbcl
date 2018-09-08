@@ -25,35 +25,37 @@
 
 ;;; the number of references that a TN must have to offset the
 ;;; overhead of saving the TN across a call
-(defvar *backend-register-save-penalty* 0)
+(defglobal *backend-register-save-penalty* 3)
 (declaim (type index *backend-register-save-penalty*))
 
 ;;; the byte order of the target machine. :BIG-ENDIAN has the MSB first (e.g.
 ;;; IBM RT), :LITTLE-ENDIAN has the MSB last (e.g. DEC VAX).
-(defvar *backend-byte-order*)
+(defglobal *backend-byte-order*
+  #!+little-endian :little-endian
+  #!+big-endian :big-endian)
 (declaim (type (member nil :little-endian :big-endian) *backend-byte-order*))
 
 ;;; translation from SC numbers to SC info structures. SC numbers are always
 ;;; used instead of names at run time, so changing this vector changes all the
 ;;; references.
-(defvar *backend-sc-numbers* (make-array sc-number-limit :initial-element nil))
+(defglobal *backend-sc-numbers* (make-array sb!vm:sc-number-limit :initial-element nil))
 (declaim (type sc-vector *backend-sc-numbers*))
 
-;;; a list of all the SBs defined, so that we can easily iterate over them
-(defvar *backend-sb-list* ())
-(declaim (type list *backend-sb-list*))
+;;; a vector of all the SBs defined, so that we can easily iterate over them
+(defglobal *backend-sbs* #())
+(declaim (type simple-vector *backend-sbs*))
 
 ;;; translation from template names to template structures
-(defvar *backend-template-names* (make-hash-table :test 'eq))
+(defglobal *backend-template-names* (make-hash-table :test 'eq))
 (declaim (type hash-table *backend-template-names*))
 
 ;;; hashtables mapping from SC and SB names to the corresponding structures
-(defvar *backend-sc-names* (make-hash-table :test 'eq))
+(defglobal *backend-sc-names* (make-hash-table :test 'eq))
 (declaim (type hash-table *backend-sc-names*))
 
 ;;; translations from primitive type names to the corresponding
 ;;; primitive-type structure.
-(defvar *backend-primitive-type-names*
+(defglobal *backend-primitive-type-names*
   (make-hash-table :test 'eq))
 (declaim (type hash-table *backend-primitive-type-names*))
 
@@ -61,7 +63,7 @@
 ;;; whatever. These names can only be used as the :ARG-TYPES or
 ;;; :RESULT-TYPES for VOPs and can map to anything else that can be
 ;;; used as :ARG-TYPES or :RESULT-TYPES (e.g. :OR, :CONSTANT).
-(defvar *backend-primitive-type-aliases* nil)
+(defglobal *backend-primitive-type-aliases* nil)
 (declaim (type list *backend-primitive-type-aliases*))
 
 ;;; The primitive type T is somewhat magical, in that it is the only
@@ -79,14 +81,14 @@
 
 ;;; a hashtable translating from VOP names to the corresponding VOP-PARSE
 ;;; structures. This information is only used at meta-compile time.
-(defvar *backend-parsed-vops* (make-hash-table :test 'eq))
+(defglobal *backend-parsed-vops* (make-hash-table :test 'eq))
 (declaim (type hash-table *backend-parsed-vops*))
 
 ;;; mappings between CTYPE structures and the corresponding predicate.
 ;;; The type->predicate mapping is implemented as an alist because
 ;;; there is no such thing as a TYPE= hash table.
-(defvar *backend-predicate-types* (make-hash-table :test 'eq))
-(defvar *backend-type-predicates* nil)
+(defglobal *backend-predicate-types* (make-hash-table :test 'eq))
+(defglobal *backend-type-predicates* nil)
 (declaim (type hash-table *backend-predicate-types*))
 (declaim (type list *backend-type-predicates*))
 
@@ -151,8 +153,7 @@ Until SBCL-0.7pre57, this is translated as
   (:GUARD #!+(OR :SPARC-V8 (AND :SPARC-V9 (NOT :SPARC-64))) T
           #!-(OR :SPARC-V8 (AND :SPARC-V9 (NOT :SPARC-64))) NIL)
 which means that whether this VOP will ever be used is determined at
-compiler compile-time depending on the contents of
-*SHEBANG-FEATURES*?.
+compiler compile-time depending on the contents of SB!XC:*FEATURES*.
 
 As of SBCL-0.7pre57, a new special variable,
 SB-C:*BACKEND-SUBFEATURES*?, is introduced. As of that version, only
@@ -165,8 +166,10 @@ conditionalization.
 ;;; The default value of NIL means use only unguarded VOPs. The
 ;;; initial value is customizeable via
 ;;; customize-backend-subfeatures.lisp
-(defvar *backend-subfeatures*
-  '#.(sort (copy-list sb-cold:*shebang-backend-subfeatures*) #'string<))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defvar *backend-subfeatures*
+    '#.(sort (copy-list sb-cold:*shebang-backend-subfeatures*) #'string<)))
+(declaim (always-bound *backend-subfeatures*))
 
 ;;; possible *BACKEND-SUBFEATURES* values:
 ;;;

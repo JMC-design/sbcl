@@ -14,9 +14,9 @@
 ;;;; LIST and LIST*
 (define-vop (list-or-list*)
   (:args (things :more t))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:info num)
   (:results (result :scs (descriptor-reg)))
@@ -129,14 +129,13 @@
 
 (define-vop (allocate-code-object)
   (:args (boxed-arg :scs (any-reg))
-         (unboxed-arg :scs (any-reg)))
+         (unboxed-arg :scs (any-reg) :to :save))
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:temporary (:scs (any-reg) :from (:argument 0)) boxed)
   (:temporary (:scs (non-descriptor-reg)) unboxed)
   (:generator 100
-    (inst addi (fixnumize (1+ code-constants-offset)) boxed-arg boxed)
-    (inst dep 0 31 n-lowtag-bits boxed)
+    (inst addi 0 boxed-arg boxed)
     (inst srl unboxed-arg word-shift unboxed)
     (inst addi lowtag-mask unboxed unboxed)
     (inst dep 0 31 n-lowtag-bits unboxed)
@@ -165,12 +164,13 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
     (with-fixed-allocation
-        (result nil temp closure-header-widetag
+        (result nil temp closure-widetag
          (+ length closure-info-offset)
          stack-allocate-p :lowtag fun-pointer-lowtag)
       (storew function result closure-fun-slot fun-pointer-lowtag))))
@@ -183,7 +183,7 @@
   (:info stack-allocate-p)
   (:generator 10
     (with-fixed-allocation
-        (result nil temp value-cell-header-widetag value-cell-size stack-allocate-p)
+        (result nil temp value-cell-widetag value-cell-size stack-allocate-p)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
 ;;;; Automatic allocators for primitive objects.

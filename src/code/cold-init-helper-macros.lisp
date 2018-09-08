@@ -16,8 +16,7 @@
 ;;; FIXME: Perhaps this belongs in the %SYS package like some other
 ;;; cold load stuff.
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *!cold-init-forms*))
+(defvar *!cold-init-forms*)
 
 (defmacro !begin-collecting-cold-init-forms ()
   #+sb-xc '(eval-when (:compile-toplevel :execute)
@@ -33,10 +32,9 @@
   ;; In the target Lisp, stuff the forms into a named function which
   ;; will presumably be executed at the appropriate stage of cold load
   ;; (i.e. basically as soon as possible).
-  #+sb-xc (progn
-            (setf *!cold-init-forms*
-                  (nconc *!cold-init-forms* (copy-list forms)))
-            nil)
+  #+sb-xc `(eval-when (:compile-toplevel)
+             ,@(mapcar (lambda (form) `(push ',form *!cold-init-forms*))
+                       forms))
   ;; In the cross-compilation host Lisp, cold load is not a
   ;; meaningful concept. Just execute the forms at load time.
   #-sb-xc `(progn ,@forms))
@@ -44,13 +42,13 @@
 (defmacro !defun-from-collected-cold-init-forms (name)
   #+sb-xc `(progn
              (defun ,name ()
-               ,@*!cold-init-forms*
+               ,@(reverse *!cold-init-forms*)
                (values))
              (eval-when (:compile-toplevel :execute)
                (makunbound '*!cold-init-forms*)))
   #-sb-xc (declare (ignore name)))
 
-;;; !DEFGLOBAL, !DEFPARAMETER and !DEFVAR are named by analogy
+;;; !DEFINE-LOAD-TIME-GLOBAL, !DEFPARAMETER and !DEFVAR are named by analogy
 ;;; with !COLD-INIT-FORMS and (not DEF!FOO) because they are
 ;;; basically additional cold-init-helpers to avoid the tedious sequence:
 ;;;    (!begin-collecting-cold-init-forms)
@@ -63,19 +61,11 @@
 ;;; when writing out the cold core image.
 (macrolet ((def (wrapper real-name)
              `(defmacro ,wrapper (sym value &optional (doc nil doc-p))
-                `(progn (eval-when (:compile-toplevel)
-                          (!delayed-cold-set-symbol-value ',sym ',value))
-                        (,',real-name ,sym ,value ,@(if doc-p (list doc)))))))
-  (def !defglobal defglobal)
+                `(progn (,',real-name ,sym ,value ,@(if doc-p (list doc)))
+                        #-sb-xc-host (sb!fasl::setq-no-questions-asked ,sym ,value)))))
+  (def !define-load-time-global define-load-time-global)
   (def !defparameter defparameter)
   (def !defvar defvar))
-
-(defun !delayed-cold-set-symbol-value (symbol value-form)
-  ;; Obfuscate the reference into SB-COLD to avoid "bad package for target"
-  (let ((list (find-symbol "*SYMBOL-VALUES-FOR-GENESIS*" "SB-COLD")))
-    (set list (acons symbol
-                     (cons value-form (package-name *package*))
-                     (delete symbol (symbol-value list) :key #'car)))))
 
 (defmacro !set-load-form-method (class-name usable-by &optional method)
   ;; If USABLE-BY is:
@@ -110,11 +100,35 @@
                (declare (ignorable obj env))
                ,target-expr))))))
 
-;;; FIXME: Consider renaming this file asap.lisp,
-;;; and the renaming the various things
-;;;   *ASAP-FORMS* or *REVERSED-ASAP-FORMS*
-;;;   WITH-ASAP-FORMS
-;;;   ASAP or EVAL-WHEN-COLD-LOAD
-;;;   DEFUN-FROM-ASAP-FORMS
-;;; If so, add a comment explaining that ASAP is colloquial English for "as
-;;; soon as possible", and has nothing to do with "system area pointer".
+;;; Define a variable that is initialized in create_thread_struct() before any
+;;; Lisp code can execute. In particular, *RESTART-CLUSTERS* and *HANDLER-CLUSTERS*
+;;; should have a value before anything else happens.
+;;; While thread-local vars are generally useful, this is not the implementation
+;;; that would exist in the target system, if exposed more generally.
+;;; (Among the issues is the very restricted initialization form)
+(defmacro !define-thread-local (name initform &optional docstring)
+  (check-type initform (or fixnum symbol))
+  #!-sb-thread `(progn
+                  (eval-when (:compile-toplevel :load-toplevel :execute)
+                    (setf (info :variable :always-bound ',name) :always-bound))
+                  (!defvar ,name ,initform ,docstring))
+  #!+sb-thread `(progn
+                  #-sb-xc-host (!%define-thread-local ',name ',initform)
+                  (eval-when (:compile-toplevel :load-toplevel :execute)
+                    (setf (info :variable :wired-tls ',name) :always-thread-local)
+                    (setf (info :variable :always-bound ',name) :always-bound))
+                  (defvar ,name ,initform ,docstring)))
+
+;;; Note that this mechanism for creation of thread-locals complements the
+;;; mechanism for initializing variables that affect GC and interrupts.
+;;; Those other thread-locals are defined with an ordinary DEFVAR, but the
+;;; full list of such symbols is enumerated by !PER-THREAD-C-INTERFACE-SYMBOLS
+;;; which specifies both the list and the initial value of each symbol.
+(defvar *!thread-initial-bindings* nil)
+#+sb-xc-host
+(setf (get '!%define-thread-local :sb-cold-funcall-handler/for-effect)
+      (lambda (name initsym)
+        (push `(,name . ,initsym) *!thread-initial-bindings*)))
+#-sb-xc-host
+(defun !%define-thread-local (dummy1 dummy2) ; to avoid warning
+  (declare (ignore dummy1 dummy2)))

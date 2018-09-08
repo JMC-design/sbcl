@@ -9,6 +9,13 @@
 
 (in-package "SB-SIMPLE-STREAMS")
 
+(eval-when (:compile-toplevel)
+  (defun optional+key-style-warning-p (condition)
+    (and (typep condition '(and simple-condition style-warning))
+         (search "&OPTIONAL and &KEY found"
+                 (simple-condition-format-control condition))))
+  (proclaim '(sb-ext:muffle-conditions (satisfies optional+key-style-warning-p))))
+
 ;;;
 ;;; **********************************************************************
 ;;;
@@ -1062,7 +1069,7 @@ is supported only on simple-streams."
     (simple-stream
      (%file-position stream position))
     (ansi-stream
-     (sb-impl::ansi-stream-file-position stream position))))
+     (sb-kernel:ansi-stream-file-position stream position))))
 
 (defun file-length (stream)
   "This function returns the length of the file that File-Stream is open to."
@@ -1070,7 +1077,7 @@ is supported only on simple-streams."
     (simple-stream
      (%file-length stream))
     (ansi-stream
-     (sb-impl::stream-must-be-associated-with-file stream)
+     (sb-impl::stream-file-stream-or-lose stream)
      (funcall (sb-kernel:ansi-stream-misc stream) stream :file-length))))
 
 (defun charpos (&optional (stream *standard-output*))

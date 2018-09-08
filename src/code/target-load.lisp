@@ -14,18 +14,18 @@
 (in-package "SB!FASL")
 
 (defvar *load-source-default-type* "lisp"
-  #!+sb-doc
   "The source file types which LOAD looks for by default.")
 
 (declaim (type (or pathname null) *load-truename* *load-pathname*))
 (defvar *load-truename* nil
-  #!+sb-doc
   "the TRUENAME of the file that LOAD is currently loading")
 (defvar *load-pathname* nil
-  #!+sb-doc
   "the defaulted pathname that LOAD is currently loading")
 
 ;;;; LOAD-AS-SOURCE
+
+;;; something not EQ to anything we might legitimately READ
+(define-load-time-global *eof-object* (make-symbol "EOF-OBJECT"))
 
 ;;; Load a text stream.  (Note that load-as-fasl is in another file.)
 ;; We'd like, when entering the debugger as a result of an EVAL error,
@@ -108,23 +108,8 @@
 ;; LOADing a non-compiled file. Check whether this bug exists in SBCL
 ;; and fix it if so.
 
-(defun load (pathspec &key (verbose *load-verbose*) (print *load-print*)
-             (if-does-not-exist t) (external-format :default))
-  #!+sb-doc
-  "Load the file given by FILESPEC into the Lisp environment, returning
-   T on success."
-  (flet ((load-stream (stream faslp)
-           (when (and (fd-stream-p stream)
-                      (eq (sb!impl::fd-stream-fd-type stream) :directory))
-             (error 'simple-file-error
-                    :pathname (pathname stream)
-                    :format-control
-                    "Can't LOAD a directory: ~s."
-                    :format-arguments (list (pathname stream))))
-           (let* (;; Bindings required by ANSI.
-                  (*readtable* *readtable*)
-                  (*package* (sane-package))
-                  ;; FIXME: we should probably document the circumstances
+(defun call-with-load-bindings (function stream)
+           (let* (;; FIXME: we should probably document the circumstances
                   ;; where *LOAD-PATHNAME* and *LOAD-TRUENAME* aren't
                   ;; pathnames during LOAD.  ANSI makes no exceptions here.
                   (*load-pathname* (handler-case (pathname stream)
@@ -137,28 +122,45 @@
                                      (handler-case (truename stream)
                                        (file-error () nil))))
                   ;; Bindings used internally.
-                  (*load-depth* (1+ *load-depth*))
-                  ;; KLUDGE: I can't find in the ANSI spec where it says
-                  ;; that DECLAIM/PROCLAIM of optimization policy should
-                  ;; have file scope. CMU CL did this, and it seems
-                  ;; reasonable, but it might not be right; after all,
-                  ;; things like (PROCLAIM '(TYPE ..)) don't have file
-                  ;; scope, and I can't find anything under PROCLAIM or
-                  ;; COMPILE-FILE or LOAD or OPTIMIZE which justifies this
-                  ;; behavior. Hmm. -- WHN 2001-04-06
-                  (sb!c::*policy* sb!c::*policy*))
-             (return-from load
-               (if faslp
-                   (prog1 (load-as-fasl stream verbose print)
-                     ;; Try to ameliorate immobile heap fragmentation
-                     ;; in case somehow nontoplevel code is garbage.
-                     #!+immobile-code (gc))
-                   (sb!c:with-compiler-error-resignalling
-                     (load-as-source stream :verbose verbose
-                                            :print print)))))))
+                  (*load-depth* (1+ *load-depth*)))
+             (funcall function)))
+
+(defun load (pathspec &key (verbose *load-verbose*) (print *load-print*)
+             (if-does-not-exist t) (external-format :default))
+  "Load the file given by FILESPEC into the Lisp environment, returning
+   T on success."
+  (flet ((load-stream (stream faslp)
+           (when (and (fd-stream-p stream)
+                      (eq (sb!impl::fd-stream-fd-type stream) :directory))
+             (error 'simple-file-error
+                    :pathname (pathname stream)
+                    :format-control
+                    "Can't LOAD a directory: ~s."
+                    :format-arguments (list (pathname stream))))
+           (dx-flet ((thunk ()
+                       (let ( ;; Bindings required by ANSI.
+                             (*readtable* *readtable*)
+                             (*package* (sane-package))
+                             ;; KLUDGE: I can't find in the ANSI spec where it says
+                             ;; that DECLAIM/PROCLAIM of optimization policy should
+                             ;; have file scope. CMU CL did this, and it seems
+                             ;; reasonable, but it might not be right; after all,
+                             ;; things like (PROCLAIM '(TYPE ..)) don't have file
+                             ;; scope, and I can't find anything under PROCLAIM or
+                             ;; COMPILE-FILE or LOAD or OPTIMIZE which justifies this
+                             ;; behavior. Hmm. -- WHN 2001-04-06
+                             (sb!c::*policy* sb!c::*policy*))
+                         (if faslp
+                             (load-as-fasl stream verbose print)
+                             (sb!c:with-compiler-error-resignalling
+                                 (load-as-source stream :verbose verbose
+                                                        :print print))))))
+             (call-with-load-bindings #'thunk stream))))
+
     ;; Case 1: stream.
     (when (streamp pathspec)
       (return-from load (load-stream pathspec (fasl-header-p pathspec))))
+
     (let ((pathname (pathname pathspec)))
       ;; Case 2: Open as binary, try to process as a fasl.
       (with-open-stream
@@ -188,6 +190,7 @@
           (when (and (or should-be-fasl-p (not (eql 0 (file-length stream))))
                      (fasl-header-p stream :errorp should-be-fasl-p))
             (return-from load (load-stream stream t)))))
+
       ;; Case 3: Open using the given external format, process as source.
       (with-open-file (stream pathname :external-format external-format
                               :class 'form-tracking-stream)
@@ -231,42 +234,53 @@
           (defaulted-fasl-truename defaulted-fasl-pathname)
           (defaulted-source-truename defaulted-source-pathname))))
 
-;;; Load a code object. BOX-NUM objects are popped off the stack for
-;;; the boxed storage section, then CODE-LENGTH bytes of code are read in.
-(defun load-code (nfuns box-num code-length stack ptr fasl-input)
-  (declare (fixnum box-num code-length))
-  (declare (simple-vector stack) (type index ptr))
-  (let* ((debug-info-index (+ ptr box-num))
-         (toplevel-p (svref stack (1+ debug-info-index)))
-         (code (sb!c:allocate-code-object #!+immobile-code (not toplevel-p)
-                                          box-num code-length)))
-    (declare (ignorable toplevel-p))
-    (setf (%code-debug-info code) (svref stack debug-info-index))
-    (loop for i of-type index from sb!vm:code-constants-offset
-          for j of-type index from ptr below debug-info-index
-          do (setf (code-header-ref code i) (svref stack j)))
-    (without-gcing
-      ;; FIXME: can this be WITH-PINNED-OBJECTS? Probably.
-      ;; We must pin the range of bytes containing instructions,
-      ;; but we also must prevent scavenging the code object until
-      ;; the embedded simple-funs have been installed,
-      ;; otherwise GC could assert that the word referenced by
-      ;; a fun offset does not have the right widetag.
-      ;; This is achieved by not writing the 'nfuns' value
-      ;; until after the loop which stores the offsets.
-      (read-n-bytes (%fasl-input-stream fasl-input)
-                    (code-instructions code) 0 code-length)
-      (loop for i from (1- nfuns) downto 0
-            do (sb!c::new-simple-fun code i (read-varint-arg fasl-input)
-                                     nfuns)))
-    code))
-
 ;;;; linkage fixups
+
+;;; Lisp assembler routines are named by Lisp symbols, not strings,
+;;; and so can be compared by EQ.
+(define-load-time-global *assembler-routines* nil)
+(declaim (code-component *assembler-routines*))
 
 ;;; how we learn about assembler routines at startup
 (defvar *!initial-assembler-routines*)
 
+(defun get-asm-routine (name &optional indirect &aux (code *assembler-routines*))
+  (awhen (the list (gethash (the symbol name) (car (%code-debug-info code))))
+    (sap-int (sap+ (code-instructions code)
+                   (if indirect
+                       ;; Return the address containing the routine address
+                       (ash (cddr it) sb!vm:word-shift)
+                       ;; Return the routine address itself
+                       (car it))))))
+
 (defun !loader-cold-init ()
-  (/show0 "/!loader-cold-init")
-  (dolist (routine *!initial-assembler-routines*)
-    (setf (gethash (car routine) *assembler-routines*) (cdr routine))))
+  (let* ((code *assembler-routines*)
+         ;; Neither CODE-SIZE nor TEXT-SIZE delimits the final asm routine.
+         ;; CODE-SIZE minus 2 includes the trailing NOP filler but excludes
+         ;; the two trailer words, so it's the most consistent choice.
+         ;; (all routines are padded to a multiple of 2 words)
+         (size (- (%code-code-size code) (* 2 sb!vm:n-word-bytes)))
+         (vector (the simple-vector *!initial-assembler-routines*))
+         (count (length vector))
+         (ht (make-hash-table :test 'eq)))
+    (rplaca (%code-debug-info code) ht)
+    (dotimes (i count)
+      (destructuring-bind (name . offset) (svref vector i)
+        (let ((next-offset (if (< (1+ i) count) (cdr (svref vector (1+ i))) size)))
+          (aver (> next-offset offset))
+          ;; store inclusive bounds on PC offset range and the function index
+          (setf (gethash name ht) (list* offset (1- next-offset) i)))))))
+
+(defun !warm-load (file)
+  (restart-case (let ((sb!c::*source-namestring*
+                       (format nil "SYS:~A" (substitute #\; #\/ file))))
+                  (load file))
+    (abort ()
+      :report "Abort building SBCL."
+      (sb!ext:exit :code 1))))
+
+;;; Remember where cold artifacts went, and put the warm ones there too
+;;; because it looks nicer not to scatter them throughout the source tree.
+;;; *t-o-prefix* isn't known to the compiler, and we need it to be
+;;; initialized from a constant, so use read-time eval.
+(defvar *!target-obj-prefix* #.sb-cold::*target-obj-prefix*)

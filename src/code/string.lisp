@@ -9,11 +9,9 @@
 
 (in-package "SB!IMPL")
 
-(eval-when (:compile-toplevel)
-  (sb!xc:defmacro %string (x) `(if (stringp ,x) ,x (string ,x))))
+(defmacro %string (x) `(if (stringp ,x) ,x (string ,x)))
 
 (defun string (x)
-  #!+sb-doc
   "Coerces X into a string. If X is a string, X is returned. If X is a
    symbol, its name is returned. If X is a character then a one element
    string containing that character is returned. If X cannot be coerced
@@ -36,11 +34,10 @@
 (defun %check-vector-sequence-bounds (vector start end)
   (%check-vector-sequence-bounds vector start end))
 
-(eval-when (:compile-toplevel)
 ;;; WITH-ONE-STRING is used to set up some string hacking things. The
 ;;; keywords are parsed, and the string is hacked into a
 ;;; simple-string.
-(sb!xc:defmacro with-one-string ((string start end) &body forms)
+(defmacro with-one-string ((string start end) &body forms)
   `(let ((,string (%string ,string)))
      (with-array-data ((,string ,string)
                        (,start ,start)
@@ -49,8 +46,8 @@
        ,@forms)))
 ;;; WITH-TWO-STRINGS is used to set up string comparison operations. The
 ;;; keywords are parsed, and the strings are hacked into SIMPLE-STRINGs.
-(sb!xc:defmacro with-two-strings (string1 string2 start1 end1 cum-offset-1
-                                  start2 end2 &rest forms)
+(defmacro with-two-strings (string1 string2 start1 end1 cum-offset-1
+                            start2 end2 &rest forms)
   `(let ((,string1 (%string ,string1))
          (,string2 (%string ,string2)))
      (with-array-data ((,string1 ,string1 :offset-var ,cum-offset-1)
@@ -63,7 +60,7 @@
                          :check-fill-pointer t)
          ,@forms))))
 
-(sb!xc:defmacro with-two-arg-strings (string1 string2 start1 end1 cum-offset-1
+(defmacro with-two-arg-strings (string1 string2 start1 end1 cum-offset-1
                                       start2 end2 &rest forms)
   `(let ((,string1 (%string ,string1))
          (,string2 (%string ,string2)))
@@ -77,10 +74,7 @@
                          :check-fill-pointer t)
          ,@forms))))
 
-) ; EVAL-WHEN
-
 (defun char (string index)
-  #!+sb-doc
   "Given a string and a non-negative integer index less than the length of
   the string, returns the character object representing the character at
   that position in the string."
@@ -92,7 +86,6 @@
   (setf (char string index) new-el))
 
 (defun schar (string index)
-  #!+sb-doc
   "SCHAR returns the character object at an indexed position in a string
    just as CHAR does, except the string must be a simple-string."
   (declare (optimize (safety 1)))
@@ -190,11 +183,9 @@
                                           string2 start2 end2)))
       (if comparison (- (the fixnum comparison) offset1)))))
 
-(eval-when (:compile-toplevel :execute)
-
 ;;; LESSP is true if the desired expansion is for STRING<* or STRING<=*.
 ;;; EQUALP is true if the desired expansion is for STRING<=* or STRING>=*.
-(sb!xc:defmacro string<>=*-body (lessp equalp)
+(defmacro string<>=*-body (lessp equalp)
   (let ((offset1 (gensym)))
     `(with-two-strings string1 string2 start1 end1 ,offset1 start2 end2
        (let ((index (%sp-string-compare string1 start1 end1
@@ -215,7 +206,6 @@
                     (- (the fixnum index) ,offset1))
                    (t nil))
              ,(if equalp `(- (the fixnum end1) ,offset1) nil))))))
-) ; EVAL-WHEN
 
 (defun string<* (string1 string2 start1 end1 start2 end2)
   (declare (fixnum start1 start2))
@@ -234,7 +224,6 @@
   (string<>=*-body nil t))
 
 (defun string< (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings, if the first string is lexicographically less than
   the second string, returns the longest common prefix (using char=)
   of the two strings. Otherwise, returns ()."
@@ -244,7 +233,6 @@
   (string<* string1 string2 0 nil 0 nil))
 
 (defun string> (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings, if the first string is lexicographically greater than
   the second string, returns the longest common prefix (using char=)
   of the two strings. Otherwise, returns ()."
@@ -254,7 +242,6 @@
   (string>* string1 string2 0 nil 0 nil))
 
 (defun string<= (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings, if the first string is lexicographically less than
   or equal to the second string, returns the longest common prefix
   (using char=) of the two strings. Otherwise, returns ()."
@@ -264,7 +251,6 @@
   (string<=* string1 string2 0 nil 0 nil))
 
 (defun string>= (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings, if the first string is lexicographically greater
   than or equal to the second string, returns the longest common prefix
   (using char=) of the two strings. Otherwise, returns ()."
@@ -282,7 +268,6 @@
 ;;; efficient way to test for strings which begin with a particular
 ;;; pattern. Alas..) -- WHN 19991206
 (defun string= (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings (string1 and string2), and optional integers start1,
   start2, end1 and end2, compares characters in string1 to characters in
   string2 (using char=)."
@@ -292,7 +277,6 @@
   (string=* string1 string2 0 nil 0 nil))
 
 (defun string/= (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings, if the first string is not lexicographically equal
   to the second string, returns the longest common prefix (using char=)
   of the two strings. Otherwise, returns ()."
@@ -301,36 +285,31 @@
 (defun two-arg-string/= (string1 string2)
   (string/=* string1 string2 0 nil 0 nil))
 
-(eval-when (:compile-toplevel :execute)
-
 ;;; STRING-NOT-EQUAL-LOOP is used to generate character comparison loops for
 ;;; STRING-EQUAL and STRING-NOT-EQUAL.
-(sb!xc:defmacro string-not-equal-loop (end
-                                       end-value
+(defmacro string-not-equal-loop (end end-value
                                        &optional (abort-value nil abortp))
   (declare (fixnum end))
   (let ((end-test (if (= end 1)
                       `(= index1 (the fixnum end1))
                       `(= index2 (the fixnum end2)))))
-    `(locally (declare (inline two-arg-char-equal))
-       (do ((index1 start1 (1+ index1))
-            (index2 start2 (1+ index2)))
-           (,(if abortp
-                 end-test
-                 `(or ,end-test
-                      (not (char-equal (schar string1 index1)
-                                       (schar string2 index2)))))
-            ,end-value)
-         (declare (fixnum index1 index2))
-         ,@(if abortp
-               `((if (not (char-equal (schar string1 index1)
-                                      (schar string2 index2)))
-                     (return ,abort-value))))))))
-
-) ; EVAL-WHEN
+    `(do ((index1 start1 (1+ index1))
+         (index2 start2 (1+ index2)))
+        (,(if abortp
+              end-test
+              `(or ,end-test
+                   (not (two-arg-char-equal-inline
+                         (schar string1 index1)
+                         (schar string2 index2)))))
+         ,end-value)
+      (declare (fixnum index1 index2))
+      ,@(if abortp
+            `((if (not (two-arg-char-equal-inline
+                        (schar string1 index1)
+                        (schar string2 index2)))
+                  (return ,abort-value)))))))
 
 (defun string-equal (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings (string1 and string2), and optional integers start1,
   start2, end1 and end2, compares characters in string1 to characters in
   string2 (using char-equal)."
@@ -352,7 +331,6 @@
         (string-not-equal-loop 1 t nil)))))
 
 (defun string-not-equal (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings, if the first string is not lexicographically equal
   to the second string, returns the longest common prefix (using char-equal)
   of the two strings. Otherwise, returns ()."
@@ -379,7 +357,7 @@
             (t
              (string-not-equal-loop 2 (- index1 offset1)))))))
 
-(eval-when (:compile-toplevel :execute)
+(eval-when (:compile-toplevel :load-toplevel :execute)
 
 ;;; STRING-LESS-GREATER-EQUAL-TESTS returns a test on the lengths of string1
 ;;; and string2 and a test on the current characters from string1 and string2
@@ -396,30 +374,28 @@
           (values '>= `(not (char-lessp char1 char2)))
           ;; STRING-GREATERP
           (values '> `(char-greaterp char1 char2)))))
+) ; EVAL-WHEN
 
-(sb!xc:defmacro string-less-greater-equal (lessp equalp)
+(defmacro string-less-greater-equal (lessp equalp)
   (multiple-value-bind (length-test character-test)
       (string-less-greater-equal-tests lessp equalp)
-    `(locally (declare (inline two-arg-char-equal))
-       (with-two-strings string1 string2 start1 end1 offset1 start2 end2
-         (let ((slen1 (- (the fixnum end1) start1))
-               (slen2 (- (the fixnum end2) start2)))
-           (declare (fixnum slen1 slen2))
-           (do ((index1 start1 (1+ index1))
-                (index2 start2 (1+ index2))
-                (char1)
-                (char2))
-               ((or (= index1 (the fixnum end1)) (= index2 (the fixnum end2)))
-                (if (,length-test slen1 slen2) (- index1 offset1)))
-             (declare (fixnum index1 index2))
-             (setq char1 (schar string1 index1))
-             (setq char2 (schar string2 index2))
-             (if (not (char-equal char1 char2))
-                 (if ,character-test
-                     (return (- index1 offset1))
-                     (return ())))))))))
-
-) ; EVAL-WHEN
+    `(with-two-strings string1 string2 start1 end1 offset1 start2 end2
+       (let ((slen1 (- (the fixnum end1) start1))
+             (slen2 (- (the fixnum end2) start2)))
+         (declare (fixnum slen1 slen2))
+         (do ((index1 start1 (1+ index1))
+              (index2 start2 (1+ index2))
+              (char1)
+              (char2))
+             ((or (= index1 (the fixnum end1)) (= index2 (the fixnum end2)))
+              (if (,length-test slen1 slen2) (- index1 offset1)))
+           (declare (fixnum index1 index2))
+           (setq char1 (schar string1 index1))
+           (setq char2 (schar string2 index2))
+           (if (not (two-arg-char-equal-inline char1 char2))
+               (if ,character-test
+                   (return (- index1 offset1))
+                   (return ()))))))))
 
 (defun string-lessp* (string1 string2 start1 end1 start2 end2)
   (declare (fixnum start1 start2))
@@ -438,7 +414,6 @@
   (string-less-greater-equal t t))
 
 (defun string-lessp (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings, if the first string is lexicographically less than
   the second string, returns the longest common prefix (using char-equal)
   of the two strings. Otherwise, returns ()."
@@ -448,7 +423,6 @@
   (string-lessp* string1 string2 0 nil 0 nil))
 
 (defun string-greaterp (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings, if the first string is lexicographically greater than
   the second string, returns the longest common prefix (using char-equal)
   of the two strings. Otherwise, returns ()."
@@ -458,7 +432,6 @@
   (string-greaterp* string1 string2 0 nil 0 nil))
 
 (defun string-not-lessp (string1 string2 &key (start1 0) end1 (start2 0) end2)
-  #!+sb-doc
   "Given two strings, if the first string is lexicographically greater
   than or equal to the second string, returns the longest common prefix
   (using char-equal) of the two strings. Otherwise, returns ()."
@@ -469,7 +442,6 @@
 
 (defun string-not-greaterp (string1 string2 &key (start1 0) end1 (start2 0)
                                     end2)
-  #!+sb-doc
   "Given two strings, if the first string is lexicographically less than
   or equal to the second string, returns the longest common prefix
   (using char-equal) of the two strings. Otherwise, returns ()."
@@ -482,7 +454,6 @@
 (defun make-string (count &key
                     (element-type 'character)
                     ((:initial-element fill-char)))
-  #!+sb-doc
   "Given a character count and an optional fill character, makes and returns a
 new string COUNT long filled with the fill character."
   (declare (index count))
@@ -562,28 +533,40 @@ new string COUNT long filled with the fill character."
                       (start)
                       (end)
                       :check-fill-pointer t)
-      (let* ((left-end (if left-p
-                           (do ((index start (1+ index)))
-                               ((or (= index (the fixnum end))
-                                    (not (find (schar string index)
-                                               char-bag
-                                               :test #'char=)))
-                                index)
-                             (declare (fixnum index)))
-                           start))
-             (right-end (if right-p
-                            (do ((index (1- (the fixnum end)) (1- index)))
-                                ((or (< index left-end)
-                                     (not (find (schar string index)
-                                                char-bag
-                                                :test #'char=)))
-                                 (1+ index))
-                              (declare (fixnum index)))
-                            end)))
-        (if (and (eql left-end start)
-                 (eql right-end end))
-            header
-            (subseq (the simple-string string) left-end right-end))))))
+      (flet ((trim-char-p (char)
+               (typecase char-bag
+                 (list
+                  (loop for bag-char in char-bag
+                        thereis (char= bag-char char)))
+                 (simple-string
+                  (loop for bag-char across char-bag
+                        thereis (char= bag-char char)))
+                 (simple-vector
+                  (loop for bag-char across char-bag
+                        thereis (char= bag-char char)))
+                 (vector
+                  (loop for bag-char across char-bag
+                        thereis (char= bag-char char)))
+                 (t
+                  (find char char-bag :test #'char=)))))
+        (let* ((left-end (if left-p
+                             (do ((index start (1+ index)))
+                                 ((or (= index (the fixnum end))
+                                      (not (trim-char-p (schar string index))))
+                                  index)
+                               (declare (fixnum index)))
+                             start))
+               (right-end (if right-p
+                              (do ((index (1- (the fixnum end)) (1- index)))
+                                  ((or (< index left-end)
+                                       (not (trim-char-p (schar string index))))
+                                   (1+ index))
+                                (declare (fixnum index)))
+                              end)))
+          (if (and (eql left-end start)
+                   (eql right-end end))
+              header
+              (subseq (the simple-string string) left-end right-end)))))))
 
 (defun string-left-trim (char-bag string)
   (generic-string-trim char-bag string t nil))
@@ -593,3 +576,14 @@ new string COUNT long filled with the fill character."
 
 (defun string-trim (char-bag string)
   (generic-string-trim char-bag string t t))
+
+(defun logically-readonlyize (vector &optional (always-shareable t))
+  ;; "Always" means that regardless of whether the user want
+  ;; coalescing of strings used as literals in code compiled to memory,
+  ;; the string is shareable.
+  ;;  #b01_ ; symbol name, literal compiled to fasl, some other stuff
+  ;;  #b10_ ; literal compiled to core
+  (set-header-data (the (simple-array * 1) vector)
+                   (if always-shareable
+                       sb!vm:+vector-shareable+
+                       sb!vm:+vector-shareable-nonstd+)))

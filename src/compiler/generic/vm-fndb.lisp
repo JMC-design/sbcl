@@ -26,6 +26,7 @@
            #!+sb-unicode character-string-p
            #!+sb-unicode simple-character-string-p
            array-header-p
+           simple-array-header-p
            sequencep extended-sequence-p
            simple-array-p simple-array-nil-p vector-nil-p
            simple-array-unsigned-byte-2-p
@@ -64,10 +65,12 @@
            #!+64-bit
            signed-byte-64-p
            weak-pointer-p code-component-p lra-p
+           sb!vm::unbound-marker-p
            simple-fun-p
            closurep
-           funcallable-instance-p)
-  (t) boolean (movable foldable flushable))
+           funcallable-instance-p
+           non-null-symbol-p)
+    (t) boolean (movable foldable flushable))
 
 (defknown #.(loop for (name) in *vector-without-complex-typecode-infos*
                   collect name)
@@ -110,24 +113,37 @@
   (always-translatable flushable)
   :result-arg 0)
 
-(defknown vector-fill* (t t t t) vector
+(defknown (vector-fill* vector-fill/t) (t t t t) vector
   ()
   :result-arg 0)
 
+;;; Return the length of VECTOR.
+;;; Ordinary code should prefer to use (LENGTH (THE VECTOR FOO)) instead.
 (defknown vector-length (vector) index (flushable dx-safe))
 
 (defknown vector-sap ((simple-unboxed-array (*))) system-area-pointer
   (flushable))
 
-(defknown lowtag-of (t) (unsigned-byte #.sb!vm:n-lowtag-bits)
-  (flushable movable))
+#!+gencgc
+(defknown generation-of (t) (or (signed-byte 8) null) (flushable movable))
+
+;;; WIDETAG-OF needs extra code to handle LIST and FUNCTION lowtags.
+;;; When dealing with known other-pointers (dispatching on array
+;;; element type for example), %OTHER-POINTER-WIDETAG is faster.
 (defknown (widetag-of %other-pointer-widetag) (t)
   (unsigned-byte #.sb!vm:n-widetag-bits)
   (flushable movable))
 
-(defknown (get-header-data get-closure-length) (t)
+;;; Return the data from the header of object, which for GET-HEADER-DATA
+;;; must be an other-pointer, and for GET-CLOSURE-LENGTH a fun-pointer.
+(defknown (get-header-data) (t)
     (unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits))
   (flushable))
+;;; Closures have at least a trampoline word (length can't be 0),
+;;; and only 15 bits in which to express the payload size.
+(defknown (get-closure-length) (t) (integer 1 #.sb!vm:short-header-max-words)
+  (flushable))
+
 ;;; This unconventional setter returns its first arg, not the newval.
 (defknown set-header-data
     (t (unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits))) t)
@@ -137,11 +153,15 @@
 (defknown sb!vm::cas-header-data-high
     (t (unsigned-byte 32) (unsigned-byte 32)) (unsigned-byte 32)))
 
-(defknown %array-dimension (t index) index
+(defknown %array-dimension (array index) index
   (flushable))
-(defknown %set-array-dimension (t index index) index
+(defknown %set-array-dimension (array index index) index
   ())
-(defknown %array-rank (t) array-rank
+(defknown %array-rank (array) array-rank
+  (flushable))
+
+#!+x86-64
+(defknown (%array-rank= widetag=) (t t) boolean
   (flushable))
 
 (defknown sb!kernel::check-array-shape (simple-array list)
@@ -203,12 +223,15 @@
   (always-translatable))
 
 ;;; These two are mostly used for bit-bashing operations.
-(defknown %vector-raw-bits (t fixnum) sb!vm:word
+(defknown %vector-raw-bits (t index) sb!vm:word
   (flushable))
-(defknown (%set-vector-raw-bits) (t fixnum sb!vm:word) sb!vm:word
+(defknown (%set-vector-raw-bits) (t index sb!vm:word) sb!vm:word
   ())
 
 
+;;; Allocate an unboxed, non-fancy vector with type code TYPE, length LENGTH,
+;;; and WORDS words long. Note: it is your responsibility to ensure that the
+;;; relation between LENGTH and WORDS is correct.
 (defknown allocate-vector ((unsigned-byte 8) index
                            ;; The number of words is later converted
                            ;; to bytes, make sure it fits.
@@ -225,7 +248,8 @@
     (simple-array * (*))
     (flushable movable))
 
-(defknown make-array-header ((unsigned-byte 8) (unsigned-byte 24)) array
+;;; Allocate an array header with type code TYPE and rank RANK.
+(defknown make-array-header ((unsigned-byte 8) (mod #.sb!xc:array-rank-limit)) array
   (flushable movable))
 
 (defknown make-array-header* (&rest t) array (flushable movable))
@@ -290,15 +314,16 @@
 
 ;;;; debugger support
 
-(defknown current-sp () system-area-pointer (movable flushable))
-(defknown current-fp () system-area-pointer (movable flushable))
+(defknown sb!vm::current-thread-offset-sap (fixnum)
+  system-area-pointer (flushable))
+(defknown (current-sp current-fp) () system-area-pointer (movable flushable))
+(defknown current-fp-fixnum () fixnum (movable flushable))
 (defknown stack-ref (system-area-pointer index) t (flushable))
 (defknown %set-stack-ref (system-area-pointer index t) t ())
 (defknown lra-code-header (t) t (movable flushable))
 (defknown fun-code-header (t) t (movable flushable))
 (defknown %make-lisp-obj (sb!vm:word) t (movable flushable))
 (defknown get-lisp-obj-address (t) sb!vm:word (movable flushable))
-(defknown fun-word-offset (function) index (movable flushable))
 
 ;;;; 32-bit logical operations
 
@@ -419,14 +444,14 @@
 
 ;;;; code/function/fdefn object manipulation routines
 
+;;; Return a SAP pointing to the instructions part of CODE-OBJ.
 (defknown code-instructions (t) system-area-pointer (flushable movable))
+;;; Extract the INDEXth element from the header of CODE-OBJ. Can be
+;;; set with SETF.
 (defknown code-header-ref (t index) t (flushable))
 (defknown code-header-set (t index t) t ())
 
-(defknown fun-subtype (function)
-  (member #.sb!vm:simple-fun-header-widetag
-          #.sb!vm:closure-header-widetag
-          #.sb!vm:funcallable-instance-header-widetag)
+(defknown fun-subtype (function) (member . #.sb!vm::+function-widetags+)
   (flushable))
 
 (defknown make-fdefn (t) fdefn (flushable movable))
@@ -435,19 +460,19 @@
 (defknown fdefn-fun (fdefn) (or function null) (flushable))
 (defknown (setf fdefn-fun) (function fdefn) t ())
 (defknown fdefn-makunbound (fdefn) t ())
+;;; FDEFN -> FUNCTION, trapping if not FBOUNDP
 (defknown safe-fdefn-fun (fdefn) function ())
 
-(defknown %simple-fun-self (function) function
-  (flushable))
-(defknown (setf %simple-fun-self) (function function) function
-  ())
 (defknown %simple-fun-type (function) t (flushable))
 
-(defknown %closure-fun (function) function
-  (flushable))
+#!+(or x86 x86-64) (defknown sb!vm::%closure-callee (function) fixnum (flushable))
+(defknown %closure-fun (function) function (flushable))
 
 (defknown %closure-index-ref (function index) t
   (flushable))
+
+;; T argument is for the 'fun' slot.
+(defknown sb!vm::%copy-closure (index t) function (flushable))
 
 (defknown %fun-fun (function) function (flushable recursive))
 
@@ -465,3 +490,5 @@
 (defknown %data-vector-and-index (array index)
                                  (values (simple-array * (*)) index)
                                  (foldable flushable))
+
+(defknown restart-point (t) t ())

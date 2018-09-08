@@ -22,6 +22,7 @@
 ;;; from arch-vm.lisp
 (in-package "SB!VM")
 (defsetf context-register %set-context-register)
+(defsetf boxed-context-register %set-boxed-context-register)
 (defsetf context-float-register %set-context-float-register)
 ;;; from bit-bash.lisp
 (defsetf word-sap-ref %set-word-sap-ref)
@@ -289,7 +290,6 @@
 ;;; parts rather than bind a temp for its result. (See the source transforms
 ;;; for LDB/DPB). But for constant arguments to BYTE, we don't need any temp.
 (define-setf-expander ldb (&whole form spec place &environment env)
-  #!+sb-doc
   "The first argument is a byte specifier. The second is any place form
 acceptable to SETF. Replace the specified byte of the number in this
 place with bits from the low-order end of the new value."
@@ -336,7 +336,6 @@ place with bits from the low-order end of the new value."
   (%defsetf 'truly-the (info :setf :expander 'the))
 
   (%defsetf 'mask-field (info :setf :expander 'ldb)
-  #!+sb-doc
   "The first argument is a byte specifier. The second is any place form
 acceptable to SETF. Replaces the specified byte of the number in this place
 with bits from the corresponding position in the new value.")

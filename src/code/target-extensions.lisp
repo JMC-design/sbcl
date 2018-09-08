@@ -26,14 +26,12 @@
 (declaim (type list *save-hooks* *init-hooks* *exit-hooks*))
 
 (defvar *save-hooks* nil
-  #!+sb-doc
   "A list of function designators which are called in an unspecified
 order before creating a saved core image.
 
 Unused by SBCL itself: reserved for user and applications.")
 
 (defvar *init-hooks* nil
-  #!+sb-doc
   "A list of function designators which are called in an unspecified
 order when a saved core image starts up, after the system itself has
 been initialized.
@@ -41,7 +39,6 @@ been initialized.
 Unused by SBCL itself: reserved for user and applications.")
 
 (defvar *exit-hooks* nil
-  #!+sb-doc
   "A list of function designators which are called in an unspecified
 order when SBCL process exits.
 
@@ -50,10 +47,20 @@ Unused by SBCL itself: reserved for user and applications.
 Using (SB-EXT:EXIT :ABORT T), or calling exit(3) directly circumvents
 these hooks.")
 
+(defun call-hooks (kind hooks &key (on-error :error))
+  (dolist (hook hooks)
+    (handler-case
+        (funcall hook)
+      (serious-condition (c)
+        (if (eq :warn on-error)
+            (warn "Problem running ~A hook ~S:~%  ~A" kind hook c)
+            (with-simple-restart (continue "Skip this ~A hook." kind)
+              (error "Problem running ~A hook ~S:~%  ~A" kind hook c)))))))
 
 ;;; Binary search for simple vectors
-(defun binary-search (value seq &key (key #'identity))
+(defun binary-search* (value seq key)
   (declare (simple-vector seq))
+  (declare (function key))
   (labels ((recurse (start end)
              (when (< start end)
                (let* ((i (+ start (truncate (- end start) 2)))
@@ -64,8 +71,13 @@ these hooks.")
                        ((> value key-value)
                         (recurse (1+ i) end))
                        (t
-                        elt))))))
+                        i))))))
     (recurse 0 (length seq))))
+
+(defun binary-search (value seq &key (key #'identity))
+  (let ((index (binary-search* value seq key)))
+    (if index
+        (svref seq index))))
 
 (defun double-vector-binary-search (value vector)
   (declare (simple-vector vector)
@@ -138,7 +150,20 @@ these hooks.")
                   string)))
          ,@body))))
 
-;;; The smallest power of two that is equal to or greater than X.
-(defun power-of-two-ceiling (x)
-  (declare (index x))
-  (ash 1 (integer-length (1- x))))
+(defmacro with-locked-hash-table ((hash-table) &body body)
+  "Limits concurrent accesses to HASH-TABLE for the duration of BODY.
+If HASH-TABLE is synchronized, BODY will execute with exclusive
+ownership of the table. If HASH-TABLE is not synchronized, BODY will
+execute with other WITH-LOCKED-HASH-TABLE bodies excluded -- exclusion
+of hash-table accesses not surrounded by WITH-LOCKED-HASH-TABLE is
+unspecified."
+  ;; Needless to say, this also excludes some internal bits, but
+  ;; getting there is too much detail when "unspecified" says what
+  ;; is important -- unpredictable, but harmless.
+  `(sb!thread::with-recursive-lock ((hash-table-lock ,hash-table))
+     ,@body))
+
+(defmacro with-locked-system-table ((hash-table) &body body)
+  `(sb!thread::with-recursive-system-lock
+       ((hash-table-lock ,hash-table))
+     ,@body))

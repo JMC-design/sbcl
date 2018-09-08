@@ -33,7 +33,9 @@
               (make-macro-lambda nil lambda-list body :special-form name
                                  :doc-string-allowed :external
                                  :wrap-block nil)))
-    (declare (ignorable doc))
+    (declare (ignorable doc)) ; unused on host
+    ;; Maybe kill docstring, but only under the cross-compiler.
+    #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq doc nil)
     `(progn
       (declaim (ftype (function (ctran ctran (or lvar null) t) (values))
                       ,fn-name))
@@ -47,7 +49,8 @@
         (,lambda-expr ,whole-var *lexenv*)
         (values))
       #-sb-xc-host
-      (install-guard-function ',name '(:special ,name) ,(or #!+sb-doc doc))
+      (progn (install-guard-function ',name '(:special ,name))
+             (setf (documentation (symbol-function ',name) t) ',doc))
            ;; FIXME: Evidently "there can only be one!" -- we overwrite any
            ;; other :IR1-CONVERT value. This deserves a warning, I think.
       (setf (info :function :ir1-convert ',name) #',fn-name)
@@ -266,8 +269,8 @@
 ;;;   :IMPORTANT
 ;;;           - If the transform fails and :IMPORTANT is
 ;;;               NIL,       then never print an efficiency note.
-;;;               :SLIGHTLY, then print a note if SPEED>=INHIBIT-WARNINGS.
-;;;               T,         then print a note if SPEED>INHIBIT-WARNINGS.
+;;;               :SLIGHTLY, then print a note if SPEED>INHIBIT-WARNINGS.
+;;;               T,         then print a note if SPEED>=INHIBIT-WARNINGS.
 ;;;             :SLIGHTLY is the default.
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
                                           (result-type '*)
@@ -345,151 +348,6 @@
                                  ,important
                                  policy))))))
 
-;;;; DEFKNOWN and DEFOPTIMIZER
-
-;;; This macro should be the way that all implementation independent
-;;; information about functions is made known to the compiler.
-;;;
-;;; FIXME: The comment above suggests that perhaps some of my added
-;;; FTYPE declarations are in poor taste. Should I change my
-;;; declarations, or change the comment, or what?
-;;;
-;;; FIXME: DEFKNOWN is needed only at build-the-system time. Figure
-;;; out some way to keep it from appearing in the target system.
-;;;
-;;; Declare the function NAME to be a known function. We construct a
-;;; type specifier for the function by wrapping (FUNCTION ...) around
-;;; the ARG-TYPES and RESULT-TYPE. ATTRIBUTES is an unevaluated list
-;;; of boolean attributes of the function. See their description in
-;;; (!DEF-BOOLEAN-ATTRIBUTE IR1). NAME may also be a list of names, in
-;;; which case the same information is given to all the names. The
-;;; keywords specify the initial values for various optimizers that
-;;; the function might have.
-(defmacro defknown (name arg-types result-type &optional (attributes '(any))
-                    &body keys)
-  #-sb-xc-host
-  (when (member 'unsafe attributes)
-    (style-warn "Ignoring legacy attribute UNSAFE. Replaced by its inverse: DX-SAFE.")
-    (setf attributes (remove 'unsafe attributes)))
-  (when (and (intersection attributes '(any call unwind))
-             (intersection attributes '(movable)))
-    (error "function cannot have both good and bad attributes: ~S" attributes))
-
-  (when (member 'any attributes)
-    (setq attributes (union '(unwind) attributes)))
-  (when (member 'flushable attributes)
-    (pushnew 'unsafely-flushable attributes))
-  (multiple-value-bind (foldable-call callable functional-args arg-types)
-      (make-foldable-call-check arg-types attributes)
-    `(%defknown ',(if (and (consp name)
-                           (not (legal-fun-name-p name)))
-                      name
-                      (list name))
-                '(sfunction ,arg-types ,result-type)
-                (ir1-attributes ,@attributes)
-                (source-location)
-                :foldable-call-check ,foldable-call
-                :callable-check ,callable
-                :functional-args ,functional-args
-                ,@keys)))
-
-(defun make-foldable-call-check (arg-types attributes)
-  (let ((call (member 'call attributes))
-        (fold (member 'foldable attributes)))
-    (if (not call)
-        (values nil nil nil arg-types)
-        (multiple-value-bind (llks required optional rest keys)
-            (parse-lambda-list
-             arg-types
-             :context :function-type
-             :accept (lambda-list-keyword-mask
-                      '(&optional &rest &key &allow-other-keys))
-             :silent t)
-          (let (vars
-                call-vars
-                arg-count-specified)
-            (labels ((callable-p (x)
-                     (member x '(callable function)))
-                   (process-var (x &optional (name (gensym)))
-                     (if (callable-p (if (consp x)
-                                         (car x)
-                                         x))
-                         (push (list* name
-                                      (cond ((consp x)
-                                             (setf arg-count-specified t)
-                                             (cdr x))))
-                               call-vars)
-                         (push name vars))
-                     name)
-                   (process-type (type)
-                     (if (and (consp type)
-                              (callable-p (car type)))
-                         (car type)
-                         type))
-                   (callable-rest-p (x)
-                     (and (consp x)
-                          (callable-p (car x))
-                          (eql (cadr x) '&rest))))
-              (let* (rest-var
-                     (lambda-list
-                       (cond ((find-if #'callable-rest-p required)
-                              (setf rest-var (gensym))
-                              `(,@(loop for var in required
-                                       collect (process-var var)
-                                       until (callable-rest-p var))
-                                &rest ,rest-var))
-                             (t
-                              `(,@(mapcar #'process-var required)
-                                ,@(and optional
-                                       `(&optional ,@(mapcar #'process-var optional)))
-                                ,@(and rest
-                                       `(&rest ,@(mapcar #'process-var rest)))
-                                ,@(and (ll-kwds-keyp llks)
-                                       `(&key ,@(loop for (key type) in keys
-                                                      for var = (gensym)
-                                                      do (process-var type var)
-                                                      collect `((,key ,var))))))))))
-
-                (assert call-vars)
-                (values
-                 (and fold
-                      `(lambda ,lambda-list
-                         (declare (ignore ,@vars))
-                         (and ,@(loop for (x) in call-vars
-                                      collect `(constant-fold-arg-p ,x)))))
-                 (and arg-count-specified
-                      `(lambda ,lambda-list
-                         (declare (ignore ,@vars))
-                         ,@(loop for (x arg-count) in call-vars
-                                 when arg-count
-                                 collect (if (eq arg-count '&rest)
-                                             `(valid-callable-argument ,x (length ,rest-var))
-                                             `(valid-callable-argument ,x ,arg-count)))))
-                 (let ((tests (loop for (x arg-count no-conversion) in call-vars
-                                    unless (eq no-conversion 'no-function-conversion)
-                                    collect `(when ,x
-                                               (push (cons ,x ,(if (eq arg-count '&rest)
-                                                                   `(length ,rest-var)
-                                                                   arg-count) )
-                                                     result)))))
-                   (when tests
-                     `(lambda ,lambda-list
-                        (declare (ignore ,@vars))
-                        (let (result)
-                          ,@tests
-                          result))))
-                 `(,@(mapcar #'process-type required)
-                   ,@(and optional
-                          `(&optional ,@(mapcar #'process-type optional)))
-                   ,@(and (ll-kwds-restp llks)
-                          `(&rest ,@rest))
-                   ,@(and (ll-kwds-keyp llks)
-                          `(&key
-                            ,@(loop for (key type) in keys
-                                    collect `(,key ,(process-type type)))))
-                   ,@(and (ll-kwds-allowp llks)
-                          '(&allow-other-keys)))))))))))
-
 ;;; Create a function which parses combination args according to WHAT
 ;;; and LAMBDA-LIST, where WHAT is either a function name or a list
 ;;; (FUN-NAME KIND) and does some KIND of optimization.
@@ -689,11 +547,11 @@
            while ,node-var
            do (progn ,@body))))
 
-(defmacro do-nested-cleanups ((cleanup-var block &optional return-value)
+(defmacro do-nested-cleanups ((cleanup-var lexenv &optional return-value)
                               &body body)
   `(block nil
      (map-nested-cleanups
-      (lambda (,cleanup-var) ,@body) ,block ,return-value)))
+      (lambda (,cleanup-var) ,@body) ,lexenv ,return-value)))
 
 ;;; Bind the IR1 context variables to the values associated with NODE,
 ;;; so that new, extra IR1 conversion related to NODE can be done
@@ -704,6 +562,20 @@
      (%with-ir1-environment-from-node
       ,node
       #'closure-needing-ir1-environment-from-node)))
+
+;;; *SOURCE-PATHS* is a hashtable from source code forms to the path
+;;; taken through the source to reach the form. This provides a way to
+;;; keep track of the location of original source forms, even when
+;;; macroexpansions and other arbitary permutations of the code
+;;; happen. This table is initialized by calling FIND-SOURCE-PATHS on
+;;; the original source.
+;;;
+;;; It is fairly useless to store symbols, characters, or fixnums in
+;;; this table, as 42 is EQ to 42 no matter where in the source it
+;;; appears. GET-SOURCE-PATH and NOTE-SOURCE-PATH functions should be
+;;; always used to access this table.
+(declaim (hash-table *source-paths*))
+(defvar *source-paths*)
 
 (defmacro with-source-paths (&body forms)
   (with-unique-names (source-paths)
@@ -885,6 +757,7 @@
                 (key #'identity)
                 (test #'eql))
   (declare (type function next key test))
+  ;; #-sb-xc-host (declare (dynamic-extent next key test)) ; emits "unable" note
   (do ((current list (funcall next current)))
       ((null current) nil)
     (when (funcall test (funcall key current) element)
@@ -900,6 +773,7 @@
                     (key #'identity)
                     (test #'eql))
   (declare (type function next key test))
+  ;; #-sb-xc-host (declare (dynamic-extent next key test)) ; emits "unable" note
   (do ((current list (funcall next current))
        (i 0 (1+ i)))
       ((null current) nil)
@@ -952,7 +826,6 @@
 ;;; We use WITH-SANE-IO-SYNTAX to provide safe defaults, and provide
 ;;; *COMPILER-PRINT-VARIABLE-ALIST* for user customization.
 (defvar *compiler-print-variable-alist* nil
-  #!+sb-doc
   "an association list describing new bindings for special variables
 to be used by the compiler for error-reporting, etc. Eg.
 

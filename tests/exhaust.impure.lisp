@@ -13,14 +13,6 @@
 
 #+interpreter (sb-ext:exit :code 104)
 
-(cl:in-package :cl-user)
-
-(load "test-util.lisp")
-(load "assertoid.lisp")
-(use-package "TEST-UTIL")
-(use-package "ASSERTOID")
-
-
 ;;; Prior to sbcl-0.7.1.38, doing something like (RECURSE), even in
 ;;; safe code, would crash the entire Lisp process. Then the soft
 ;;; stack checking was introduced, which checked (in safe code) for
@@ -38,7 +30,7 @@
 (defvar *count* 100)
 
 ;;; Base-case: detecting exhaustion
-(with-test (:name (:exhaust :basic) :broken-on '(and :sunos :x86-64))
+(with-test (:name (:exhaust :basic) :broken-on (and :sunos :x86-64))
   (assert (eq :exhausted
               (handler-case
                   (recurse)
@@ -50,7 +42,7 @@
 ;;; exhaustion checking after unwinding -- and that previous test
 ;;; didn't break it.
 (with-test (:name (:exhaust :non-local-control)
-                  :broken-on '(and :sunos :x86-64)
+                  :broken-on (and :sunos :x86-64)
                   :skipped-on :win32)
   (let ((exhaust-count 0)
         (recurse-count 0))
@@ -69,7 +61,7 @@
 ;;; Check that we can safely use user-provided restarts to
 ;;; unwind.
 (with-test (:name (:exhaust :restarts)
-                  :broken-on '(and :sunos :x86-64)
+                  :broken-on (and :sunos :x86-64)
                   :skipped-on :win32)
   (let ((exhaust-count 0)
         (recurse-count 0))
@@ -100,7 +92,7 @@
       (assert ok))))
 
 (with-test (:name (:exhaust :alien-stack)
-                  :skipped-on '(or (not :c-stack-is-control-stack)))
+                  :skipped-on (or (not :c-stack-is-control-stack)))
   (let ((ok nil))
     (labels ((exhaust-alien-stack (i)
                (with-alien ((integer-array (array int 500)))

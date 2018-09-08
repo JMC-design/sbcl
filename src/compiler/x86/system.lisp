@@ -13,53 +13,34 @@
 
 ;;;; type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg control-stack)
-                 :target result))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (move result object)
-    (inst and result lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg)))
+  (:args (object :scs (any-reg descriptor-reg)))
   (:temporary (:sc unsigned-reg :offset eax-offset :to (:result 0)) eax)
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
     (inst mov eax object)
-    (inst and al-tn lowtag-mask)
-    (inst cmp al-tn other-pointer-lowtag)
-    (inst jmp :e other-ptr)
-    (inst cmp al-tn fun-pointer-lowtag)
-    (inst jmp :e function-ptr)
-
-    ;; Pick off structures and list pointers.
     (inst test al-tn 1)
-    (inst jmp :ne done)
-
-    ;; Pick off fixnums.
-    (inst and al-tn fixnum-tag-mask)
-    (inst jmp :e done)
-
-    ;; must be an other immediate
+    (inst jmp :z IMMEDIATE)
+    (inst and al-tn lowtag-mask)
+    (inst cmp al-tn list-pointer-lowtag)
+    (inst jmp :e IMMEDIATE)
+    ;; It's a function, instance, or other pointer.
     (inst mov eax object)
-    (inst jmp done)
+    ;; OBJECT is implicitly pinned, EAX can GC-safely point to it
+    ;; with no lowtag.
+    (inst and eax (lognot lowtag-mask)) ; native pointer
+    (inst movzx result (make-ea :byte :base eax))
+    (inst jmp DONE)
+    IMMEDIATE
+    ;; If OBJECT is in ESI or EDI we can't do a MOVZX byte-to-dword
+    ;; because there are no SIL,DIL registers. Use MOV + AND instead.
+    (move result object)
+    (inst and result #xFF)
+    DONE))
 
-    FUNCTION-PTR
-    (load-type al-tn object (- fun-pointer-lowtag))
-    (inst jmp done)
-
-    OTHER-PTR
-    (load-type al-tn object (- other-pointer-lowtag))
-
-    DONE
-    (inst movzx result al-tn)))
 
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
@@ -100,7 +81,8 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst shr res n-widetag-bits)))
+    (inst shr res n-widetag-bits)
+    (inst and res short-header-max-words)))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -132,14 +114,6 @@
 
 ;;;; allocation
 
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (load-symbol-value int *allocation-pointer*)))
-
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -147,20 +121,6 @@
   (:policy :fast-safe)
   (:generator 1
     (load-binding-stack-pointer int)))
-
-(defknown (setf binding-stack-pointer-sap)
-    (system-area-pointer) system-area-pointer ())
-
-(define-vop (set-binding-stack-pointer-sap)
-  (:args (new-value :scs (sap-reg) :target int))
-  (:arg-types system-area-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate (setf binding-stack-pointer-sap))
-  (:policy :fast-safe)
-  (:generator 1
-    (store-binding-stack-pointer new-value)
-    (move int new-value)))
 
 (define-vop (control-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
@@ -180,7 +140,8 @@
   (:result-types system-area-pointer)
   (:generator 10
     (loadw sap code 0 other-pointer-lowtag)
-    (inst shr sap n-widetag-bits)
+    (inst shl sap 2) ; shift out the two GC-reserved bits
+    (inst shr sap (+ 2 n-widetag-bits))
     (inst lea sap (make-ea :byte :base code :index sap :scale 4
                            :disp (- other-pointer-lowtag)))))
 
@@ -191,48 +152,32 @@
   (:results (func :scs (descriptor-reg) :from (:argument 0)))
   (:generator 10
     (loadw func code 0 other-pointer-lowtag)
-    (inst shr func n-widetag-bits)
+    (inst shl func 2) ; shift out the two GC-reserved bits
+    (inst shr func (+ 2 n-widetag-bits))
     (inst lea func
           (make-ea :byte :base offset :index func :scale 4
                    :disp (- fun-pointer-lowtag other-pointer-lowtag)))
     (inst add func code)))
 
-(define-vop (%simple-fun-self)
+;;; This vop is quite magical - because 'closure-fun' is a raw program counter,
+;;; as soon as it's loaded into a register, it prevents the underlying fun from
+;;; being transported by GC. It's even subtler in that sense than COMPUTE-FUN,
+;;; which doesn't pin a *different* object produced from thin air.
+;;; (It's output operand is embedded in the object pointed to by its input)
+(define-vop (%closure-fun)
   (:policy :fast-safe)
-  (:translate %simple-fun-self)
+  (:translate %closure-fun)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (descriptor-reg)))
   (:generator 3
-    (loadw result function simple-fun-self-slot fun-pointer-lowtag)
+    (loadw result function closure-fun-slot fun-pointer-lowtag)
     (inst lea result
           (make-ea :byte :base result
                    :disp (- fun-pointer-lowtag
                             (* simple-fun-code-offset n-word-bytes))))))
 
-;;; The closure function slot is a pointer to raw code on X86 instead
-;;; of a pointer to the code function object itself. This VOP is used
-;;; to reference the function object given the closure object.
-(define-source-transform %closure-fun (closure)
-  `(%simple-fun-self ,closure))
-
-(define-vop (%set-fun-self)
-  (:policy :fast-safe)
-  (:translate (setf %simple-fun-self))
-  (:args (new-self :scs (descriptor-reg) :target result :to :result)
-         (function :scs (descriptor-reg) :to :result))
-  (:temporary (:sc any-reg :from (:argument 0) :to :result) temp)
-  (:results (result :scs (descriptor-reg)))
-  (:generator 3
-    (inst lea temp (make-ea-for-object-slot new-self simple-fun-code-offset
-                                            fun-pointer-lowtag))
-    (storew temp function simple-fun-self-slot fun-pointer-lowtag)
-    (move result new-self)))
-
 ;;;; symbol frobbing
 
-;; only define if the feature is enabled to test building without it
-#!+symbol-info-vops
-(progn
 (define-vop (symbol-info-vector)
   (:policy :fast-safe)
   (:translate symbol-info-vector)
@@ -263,7 +208,7 @@
     (loadw res res cons-car-slot list-pointer-lowtag)
     (inst mov temp nil-value)
     (emit-optimized-test-inst res fixnum-tag-mask)
-    (inst cmov :e res temp))))
+    (inst cmov :e res temp)))
 
 ;;;; other miscellaneous VOPs
 
@@ -274,36 +219,37 @@
   (:generator 1
     (inst break pending-interrupt-trap)))
 
-#!+sb-safepoint
-(define-vop (insert-safepoint)
-  (:policy :fast-safe)
-  (:translate sb!kernel::gc-safepoint)
-  (:generator 0
-    (emit-safepoint)))
-
-#!+sb-thread
-(defknown current-thread-offset-sap ((unsigned-byte 32))
-  system-area-pointer (flushable))
-
 #!+sb-thread
 (define-vop (current-thread-offset-sap)
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:translate current-thread-offset-sap)
-  (:args (n :scs (unsigned-reg)
-            #!+win32 #!+win32 :to :save
-            #!-win32 #!-win32 :target sap))
-  (:arg-types unsigned-num)
+  ;; Note that SAP conflicts with N
+  (:args (n :scs (any-reg) :to :save :target sap))
+  (:arg-types tagged-num)
   (:policy :fast-safe)
   (:generator 2
     #!+win32
-    (progn
-      ;; Note that SAP conflicts with N in this case, hence the reader
-      ;; conditionals above.
-      (inst mov sap (make-ea :dword :disp +win32-tib-arbitrary-field-offset+) :fs)
-      (inst mov sap (make-ea :dword :base sap :disp 0 :index n :scale 4)))
-    #!-win32
-    (inst mov sap (make-ea :dword :disp 0 :index n :scale 4) :fs)))
+    (inst mov sap (make-ea :dword :disp +win32-tib-arbitrary-field-offset+) :fs)
+    ;; Using the FS segment, memory can be accessed only at the segment
+    ;; base specified by the descriptor (as segment-relative address 0)
+    ;; up through the segment limit. Negative indices are no good.
+    ;; Instead of accessing via FS, load thread->this into SAP,
+    ;; and then the index can be signed.
+    #!-win32 (inst mov sap (make-ea :dword :disp (ash thread-this-slot 2)) :fs)
+    (inst mov sap (make-ea :dword :base sap :index n))))
+;; ADDRESS-BASED-COUNTER-VAL uses the thread's alloc region free pointer
+;; as a quasi-random value, so that's a relatively useful case to handle
+;; without the extra instruction. Win32 needs an extra instruction always.
+#!+(and sb-thread (not win32))
+(define-vop (current-thread-offset-sap/c)
+  (:results (sap :scs (sap-reg)))
+  (:result-types system-area-pointer)
+  (:translate current-thread-offset-sap)
+  (:info n)
+  (:arg-types (:constant unsigned-byte)) ; UNSIGNED!
+  (:policy :fast-safe)
+  (:generator 1 (inst mov sap (make-ea :dword :disp (ash n 2)) :fs)))
 
 (define-vop (halt)
   (:generator 1
@@ -391,32 +337,27 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
 
 ;;;; Memory barrier support
 
-#!+memory-barrier-vops
 (define-vop (%compiler-barrier)
   (:policy :fast-safe)
   (:translate %compiler-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%memory-barrier)
   (:policy :fast-safe)
   (:translate %memory-barrier)
   (:generator 3
     (inst add (make-ea :dword :base esp-tn) 0 :lock)))
 
-#!+memory-barrier-vops
 (define-vop (%read-barrier)
   (:policy :fast-safe)
   (:translate %read-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%write-barrier)
   (:policy :fast-safe)
   (:translate %write-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%data-dependency-barrier)
   (:policy :fast-safe)
   (:translate %data-dependency-barrier)
@@ -427,68 +368,6 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (:policy :fast-safe)
   (:generator 0
     (inst pause)))
-
-;;;;
-
-(defknown %cons-cas-pair (cons t t t t) (values t t))
-;; These unsafely permits cmpxchg on any kind of vector, boxed or unboxed
-;; and the same goes for instances.
-(defknown %vector-cas-pair (simple-array index t t t t) (values t t))
-(defknown %instance-cas-pair (instance index t t t t) (values t t))
-
-(macrolet
-    ((define-cmpxchg-vop (name memory-operand more-stuff &optional index-arg)
-       `(define-vop (,name)
-          (:policy :fast)
-          ,@more-stuff
-          (:args (data :scs (descriptor-reg) :to :eval)
-                 ,@index-arg
-                 (expected-old-lo :scs (descriptor-reg any-reg) :target eax)
-                 (expected-old-hi :scs (descriptor-reg any-reg) :target edx)
-                 (new-lo :scs (descriptor-reg any-reg) :target ebx)
-                 (new-hi :scs (descriptor-reg any-reg) :target ecx))
-          (:results (result-lo :scs (descriptor-reg any-reg))
-                    (result-hi :scs (descriptor-reg any-reg)))
-          (:temporary (:sc unsigned-reg :offset eax-offset
-                       :from (:argument 2) :to (:result 0)) eax)
-          (:temporary (:sc unsigned-reg :offset edx-offset
-                       :from (:argument 3) :to (:result 0)) edx)
-          (:temporary (:sc unsigned-reg :offset ebx-offset
-                       :from (:argument 4) :to (:result 0)) ebx)
-          (:temporary (:sc unsigned-reg :offset ecx-offset
-                       :from (:argument 5) :to (:result 0)) ecx)
-          (:generator 7
-           (move eax expected-old-lo)
-           (move edx expected-old-hi)
-           (move ebx new-lo)
-           (move ecx new-hi)
-           (inst cmpxchg8b ,memory-operand :lock)
-           ;; EDX:EAX  hold the actual old contents of memory.
-           ;; Manually analyze result lifetimes to avoid clobbering.
-           (cond ((and (location= result-lo edx) (location= result-hi eax))
-                  (inst xchg eax edx)) ; unlikely, but possible
-                 ((location= result-lo edx) ; result-hi is not eax
-                  (move result-hi edx) ; move high part first
-                  (move result-lo eax))
-                 (t                    ; result-lo is not edx
-                  (move result-lo eax) ; move low part first
-                  (move result-hi edx)))))))
-  (define-cmpxchg-vop compare-and-exchange-pair
-      (make-ea :dword :base data :disp (- list-pointer-lowtag))
-      ((:translate %cons-cas-pair)))
-  (define-cmpxchg-vop compare-and-exchange-pair-indexed
-      (make-ea :dword :base data :disp offset :index index
-                      :scale (ash n-word-bytes (- n-fixnum-tag-bits)))
-      ((:variant-vars offset))
-      ((index :scs (descriptor-reg any-reg) :to :eval))))
-
-(define-vop (%vector-cas-pair compare-and-exchange-pair-indexed)
-  (:translate %vector-cas-pair)
-  (:variant (- (* n-word-bytes vector-data-offset) other-pointer-lowtag)))
-
-(define-vop (%instance-cas-pair compare-and-exchange-pair-indexed)
-  (:translate %instance-cas-pair)
-  (:variant (- (* n-word-bytes instance-slots-offset) instance-pointer-lowtag)))
 
 (defknown %cpu-identification ((unsigned-byte 32) (unsigned-byte 32))
     (values (unsigned-byte 32) (unsigned-byte 32)

@@ -50,6 +50,8 @@
 (deftype alignment ()
   `(integer 0 ,max-alignment))
 
+(defvar *asmstream*)
+
 ;;; common supertype for all the different kinds of annotations
 (defstruct (annotation (:constructor nil)
                         (:copier nil))
@@ -61,14 +63,16 @@
 (defstruct (label (:include annotation)
                    (:constructor gen-label ())
                    (:copier nil))
-  ;; (doesn't need any additional information beyond what is in the
-  ;; annotation structure)
-  )
+  (usedp nil :type boolean)) ; whether it was ever used as a branch target
+
 (defmethod print-object ((label label) stream)
-  (if (or *print-escape* *print-readably*)
-      (print-unreadable-object (label stream :type t)
-        (prin1 (sb!c:label-id label) stream))
-      (format stream "L~D" (sb!c:label-id label))))
+  (cond ((not (boundp 'sb!c::*compiler-ir-obj-map*))
+         (print-unreadable-object (label stream :type t :identity t)))
+        ((or *print-escape* *print-readably*)
+         (print-unreadable-object (label stream :type t)
+           (prin1 (sb!c:label-id label) stream)))
+        (t
+         (format stream "L~D" (sb!c:label-id label)))))
 
 ;;; Not only can DEFINE-ASSEMBLY-ROUTINE not work in the target,
 ;;; the cross-compiler never sees a DEFUN for any of the helper functions

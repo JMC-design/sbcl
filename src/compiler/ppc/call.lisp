@@ -10,8 +10,8 @@
 ;;;; files for more information.
 
 (in-package "SB!VM")
-(defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC.  If
 ;;; standard is true, then use the standard (full call) location,
@@ -28,10 +28,11 @@
 ;;; standard convention, but is totally unrestricted in non-standard
 ;;; conventions, since we can always fetch it off of the stack using
 ;;; the arg pointer.
-(defun make-old-fp-passing-location (standard)
-  (if standard
-      (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset)
-      (make-normal-tn *fixnum-primitive-type*)))
+(defun make-old-fp-passing-location ()
+  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+
+(defconstant old-fp-passing-offset
+  (make-sc+offset descriptor-reg-sc-number ocfp-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -114,8 +115,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst word 0))
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     (let ((entry-point (gen-label)))
       (emit-label entry-point)
       ;; FIXME alpha port has a ### note here saying we should "save it
@@ -283,7 +283,7 @@ default-value-8
 
             (let ((defaults (defaults)))
               (when defaults
-                (assemble (*elsewhere*)
+                (assemble (:elsewhere)
                   (emit-label default-stack-vals)
                   (do ((remaining defaults (cdr remaining)))
                       ((null remaining))
@@ -330,7 +330,7 @@ default-value-8
 
     (emit-label done)
 
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label variable-values)
       (inst compute-code-from-lra code-tn lra-tn lra-label temp)
       (do ((arg *register-arg-tns* (rest arg))
@@ -576,10 +576,12 @@ default-value-8
      (:args
       ,@(unless (eq return :tail)
           '((new-fp :scs (any-reg) :to :eval)))
-
-      ,(if named
-           '(name :target name-pass)
-           '(arg-fun :target lexenv))
+      ,@(case named
+          ((nil)
+           '((arg-fun :target lexenv)))
+          (:direct)
+          (t
+           '((name :target name-pass))))
 
       ,@(when (eq return :tail)
           '((old-fp :target old-fp-pass)
@@ -598,6 +600,7 @@ default-value-8
     (:vop-var vop)
     (:info ,@(unless (or variable (eq return :tail)) '(arg-locs))
            ,@(unless variable '(nargs))
+           ,@(when (eq named :direct) '(fun))
            ,@(when (eq return :fixed) '(nvals))
            step-instrumenting)
 
@@ -618,17 +621,21 @@ default-value-8
                   :to (:result 0))
                  return-pc-pass)
 
-     ,(if named
-          `(:temporary (:sc descriptor-reg :offset fdefn-offset ; -dan
-                            :from (:argument ,(if (eq return :tail) 0 1))
-                            :to :eval)
-                       name-pass)
-          `(:temporary (:sc descriptor-reg :offset lexenv-offset
-                            :from (:argument ,(if (eq return :tail) 0 1))
-                            :to :eval)
-                       lexenv))
-     (:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
-                 function)
+     ,@(case named
+         ((t)
+          `((:temporary (:sc descriptor-reg :offset fdefn-offset
+                         :from (:argument ,(if (eq return :tail) 0 1))
+                         :to :eval)
+                        name-pass)))
+         ((nil)
+          `((:temporary (:sc descriptor-reg :offset lexenv-offset
+                         :from (:argument ,(if (eq return :tail) 0 1))
+                         :to :eval)
+                        lexenv))))
+
+     ,@(unless (eq named :direct)
+         '((:temporary (:scs (descriptor-reg) :from (:argument 0) :to :eval)
+            function)))
      (:temporary (:sc any-reg :offset nargs-offset :to :eval)
                  nargs-pass)
 
@@ -741,54 +748,58 @@ default-value-8
                     ;; the register number of CALLABLE-TN.
                     (inst unimp (logior single-step-around-trap
                                         (ash (reg-tn-encoding callable-tn)
-                                             5)))
+                                             8)))
                     (emit-label step-done-label))))
-           ,@(if named
-                 `((sc-case name
-                     (descriptor-reg (move name-pass name))
-                     (control-stack
-                      (loadw name-pass cfp-tn (tn-offset name))
-                      (do-next-filler))
-                     (constant
-                      (loadw name-pass code-tn (tn-offset name)
-                             other-pointer-lowtag)
-                      (do-next-filler)))
-                   ;; The step instrumenting must be done after
-                   ;; FUNCTION is loaded, but before ENTRY-POINT is
-                   ;; calculated.
-                   (insert-step-instrumenting name-pass)
-                   ;; The raw-addr (ENTRY-POINT) will be one of:
-                   ;; closure-tramp, undefined-tramp, or somewhere
-                   ;; within a simple-fun object.  If the latter, then
-                   ;; it is essential (due to it being an interior
-                   ;; pointer) that the function itself be in a
-                   ;; register before the raw-addr is loaded.
-                   (sb!assem:without-scheduling ()
-                     (loadw function name-pass fdefn-fun-slot
-                            other-pointer-lowtag)
-                     (loadw entry-point name-pass fdefn-raw-addr-slot
-                            other-pointer-lowtag))
-                   (do-next-filler))
-                 `((sc-case arg-fun
-                     (descriptor-reg (move lexenv arg-fun))
-                     (control-stack
-                      (loadw lexenv cfp-tn (tn-offset arg-fun))
-                      (do-next-filler))
-                     (constant
-                      (loadw lexenv code-tn (tn-offset arg-fun)
-                             other-pointer-lowtag)
-                      (do-next-filler)))
-                   (loadw function lexenv closure-fun-slot
-                    fun-pointer-lowtag)
-                   (do-next-filler)
-                   ;; The step instrumenting must be done before
-                   ;; after FUNCTION is loaded, but before ENTRY-POINT
-                   ;; is calculated.
-                   (insert-step-instrumenting function)
-                   (inst addi entry-point function
-                    (- (ash simple-fun-code-offset word-shift)
-                     fun-pointer-lowtag))
-                   ))
+           (declare (ignorable #'insert-step-instrumenting))
+           ,@(case named
+               ((t)
+                `((sc-case name
+                    (descriptor-reg (move name-pass name))
+                    (control-stack
+                     (loadw name-pass cfp-tn (tn-offset name))
+                     (do-next-filler))
+                    (constant
+                     (loadw name-pass code-tn (tn-offset name)
+                         other-pointer-lowtag)
+                     (do-next-filler)))
+                  ;; The step instrumenting must be done after
+                  ;; FUNCTION is loaded, but before ENTRY-POINT is
+                  ;; calculated.
+                  (insert-step-instrumenting name-pass)
+                  ;; The raw-addr (ENTRY-POINT) will be one of:
+                  ;; closure-tramp, undefined-tramp, or somewhere
+                  ;; within a simple-fun object.  If the latter, then
+                  ;; it is essential (due to it being an interior
+                  ;; pointer) that the function itself be in a
+                  ;; register before the raw-addr is loaded.
+                  (sb!assem:without-scheduling ()
+                    (loadw function name-pass fdefn-fun-slot
+                        other-pointer-lowtag)
+                    (loadw entry-point name-pass fdefn-raw-addr-slot
+                        other-pointer-lowtag))
+                  (do-next-filler)))
+               ((nil)
+                `((sc-case arg-fun
+                    (descriptor-reg (move lexenv arg-fun))
+                    (control-stack
+                     (loadw lexenv cfp-tn (tn-offset arg-fun))
+                     (do-next-filler))
+                    (constant
+                     (loadw lexenv code-tn (tn-offset arg-fun)
+                         other-pointer-lowtag)
+                     (do-next-filler)))
+                  (loadw function lexenv closure-fun-slot
+                      fun-pointer-lowtag)
+                  (do-next-filler)
+                  ;; The step instrumenting must be done before
+                  ;; after FUNCTION is loaded, but before ENTRY-POINT
+                  ;; is calculated.
+                  (insert-step-instrumenting function)
+                  (inst addi entry-point function
+                        (- (ash simple-fun-code-offset word-shift)
+                           fun-pointer-lowtag))))
+               (:direct
+                `((inst lwz entry-point null-tn (static-fun-offset fun)))))
            (loop
              (if filler
                  (do-next-filler)
@@ -817,13 +828,15 @@ default-value-8
                   (load-stack-tn cur-nfp nfp-save))))
              (:tail))))))
 
-
 (define-full-call call nil :fixed nil)
 (define-full-call call-named t :fixed nil)
+(define-full-call static-call-named :direct :fixed nil)
 (define-full-call multiple-call nil :unknown nil)
 (define-full-call multiple-call-named t :unknown nil)
+(define-full-call static-multiple-call-named :direct :unknown nil)
 (define-full-call tail-call nil :tail nil)
 (define-full-call tail-call-named t :tail nil)
+(define-full-call static-tail-call-named :direct :tail nil)
 
 (define-full-call call-variable nil :fixed t)
 (define-full-call multiple-call-variable nil :unknown t)
@@ -1005,57 +1018,98 @@ default-value-8
 (define-vop (copy-more-arg)
   (:temporary (:sc any-reg :offset nl0-offset) result)
   (:temporary (:sc any-reg :offset nl1-offset) count)
-  (:temporary (:sc any-reg :offset nl2-offset) src)
   (:temporary (:sc any-reg :offset nl3-offset) dst)
   (:temporary (:sc descriptor-reg :offset l0-offset) temp)
   (:info fixed)
+  (:vop-var vop)
   (:generator 20
-    (let ((loop (gen-label))
-          (do-regs (gen-label))
-          (done (gen-label)))
-      (when (< fixed register-arg-count)
-        ;; Save a pointer to the results so we can fill in register args.
-        ;; We don't need this if there are more fixed args than reg args.
-        (move result csp-tn))
-      ;; Allocate the space on the stack.
-      (cond ((zerop fixed)
-             (inst cmpwi nargs-tn 0)
-             (inst add csp-tn csp-tn nargs-tn)
-             (inst beq done))
+    ;; Compute the end of the fixed stack frame (start of the MORE arg
+    ;; area) into RESULT.
+    (inst addi result cfp-tn
+          (* n-word-bytes (sb-allocated-size 'control-stack)))
+    ;; We can set up the NFP any time we want (can't we?), so lets get
+    ;; it out of the way early.
+    (let ((nfp-tn (current-nfp-tn vop)))
+      (when nfp-tn
+        (let ((nbytes (bytes-needed-for-non-descriptor-stack-frame)))
+          (when (> nbytes number-stack-displacement)
+            (inst stwu nsp-tn nsp-tn (- nbytes))
+            (inst addi nfp-tn nsp-tn number-stack-displacement)))))
+    ;; Compute the end of the MORE arg area (and our overall frame
+    ;; allocation) into the stack pointer, skipping the rest of the
+    ;; VOP if there are no MORE args.  FIXME: If there are more fixed
+    ;; args than there are slots allocated for the control stack frame
+    ;; then this can expose some of the MORE args to being clobbered
+    ;; if we take an asynchronous interrupt before they are copied to
+    ;; their proper location.
+    (cond ((zerop fixed)
+           (inst cmpwi nargs-tn 0)
+           (inst add csp-tn result nargs-tn)
+           (inst beq DONE))
+          (t
+           (inst addic. count nargs-tn (- (fixnumize fixed)))
+           (inst ble (assemble (:elsewhere)
+                       FIX-CSP
+                       ;; If the fixed args aren't fully supplied, the
+                       ;; (INST ADD CSP-TN RESULT COUNT) below could
+                       ;; expose part of our stack area, so branch to
+                       ;; *ELSEWHERE* and do a straight move instead.
+                       (move csp-tn result)
+                       (inst b DONE)
+                       ;; VALUES here to prevent ASSEMBLE from
+                       ;; emitting it as a label (again).
+                       (values FIX-CSP)))
+           (inst add csp-tn result count)))
+    (when (< fixed register-arg-count)
+      ;; We must stop when we run out of stack args, not when we run out of
+      ;; more args.
+      (inst addic. count nargs-tn (- (fixnumize register-arg-count)))
+      ;; Everything of interest is in registers.
+      (inst ble DO-REGS))
+    ;; Initialize dst to be end of stack.
+    (move dst csp-tn)
+
+    LOOP
+    ;; FIXME: This loop can end up copying more argument words than
+    ;; strictly necessary.  This doesn't cause incorrect operation,
+    ;; but is slightly wasteful.
+    (let ((delta (- (sb-allocated-size 'control-stack) fixed)))
+      (cond ((zerop delta)
+             ;; If DELTA is zero then all of the MORE args are in the
+             ;; right place, so we don't really need to do anything.
+             )
+            ((plusp delta)
+             ;; If DELTA is positive then the allocated stack frame is
+             ;; overlapping some of the MORE args, and we need to copy
+             ;; the list starting from the end (so that we don't
+             ;; overwrite any elements before they're copied).
+             (inst lwz temp dst (- (* (1+ delta) n-word-bytes)))
+             (inst stwu temp dst (- n-word-bytes))
+             (inst cmpw dst result)
+             (inst bgt LOOP))
             (t
-             (inst addic. count nargs-tn (- (fixnumize fixed)))
-             (inst ble done)
-             (inst add csp-tn csp-tn count)))
-      (when (< fixed register-arg-count)
-        ;; We must stop when we run out of stack args, not when we run out of
-        ;; more args.
-        (inst addic. count nargs-tn (- (fixnumize register-arg-count)))
-        ;; Everything of interest is in registers.
-        (inst ble do-regs))
-      ;; Initialize dst to be end of stack.
-      (move dst csp-tn)
-      ;; Initialize src to be end of args.
-      (inst add src cfp-tn nargs-tn)
+             ;; If DELTA is negative then the start of the MORE args
+             ;; is beyond the end of the allocated stack frame, and we
+             ;; need to copy the list from the start in order to close
+             ;; the gap.
+             (inst lwz temp result (- (* delta n-word-bytes)))
+             (inst stw temp result 0)
+             (inst addi result result n-word-bytes)
+             (inst cmpw dst result)
+             (inst bgt LOOP))))
 
-      (emit-label loop)
-      ;; *--dst = *--src, --count
-      (inst lwzu temp src (- n-word-bytes))
-      (inst addic. count count (- (fixnumize 1)))
-      (inst stwu temp dst (- n-word-bytes))
-      (inst bgt loop)
-
-      (emit-label do-regs)
-      (when (< fixed register-arg-count)
-        ;; Now we have to deposit any more args that showed up in registers.
-        (inst subic. count nargs-tn (fixnumize fixed))
-        (do ((i fixed (1+ i)))
-            ((>= i register-arg-count))
-          ;; Don't deposit any more than there are.
-          (inst beq done)
-          (inst subic. count count (fixnumize 1))
-          ;; Store it relative to the pointer saved at the start.
-          (storew (nth i *register-arg-tns*) result (- i fixed))))
-      (emit-label done))))
+    DO-REGS
+    (when (< fixed register-arg-count)
+      ;; Now we have to deposit any more args that showed up in registers.
+      (inst subic. count nargs-tn (fixnumize fixed))
+      (do ((i fixed (1+ i)))
+          ((>= i register-arg-count))
+        ;; Don't deposit any more than there are.
+        (inst beq DONE)
+        (inst subic. count count (fixnumize 1))
+        ;; Store it relative to the pointer saved at the start.
+        (storew (nth i *register-arg-tns*) result (- i fixed))))
+    DONE))
 
 
 ;;; More args are stored consecutively on the stack, starting
@@ -1156,19 +1210,6 @@ default-value-8
     (inst subi count supplied (fixnumize fixed))
     (inst sub context csp-tn count)))
 
-#!-precise-arg-count-error
-(define-vop (verify-arg-count)
-  (:policy :fast-safe)
-  (:translate sb!c::%verify-arg-count)
-  (:args (nargs :scs (any-reg)))
-  (:arg-types positive-fixnum (:constant t))
-  (:info count)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 3
-   (inst twi :ne nargs (fixnumize count))))
-
-#!+precise-arg-count-error
 (define-vop (verify-arg-count)
   (:policy :fast-safe)
   (:args (nargs :scs (any-reg)))

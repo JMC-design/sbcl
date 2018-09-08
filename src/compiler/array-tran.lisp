@@ -123,7 +123,8 @@
       (assert-lvar-type
        new-value
        (array-type-specialized-element-type type)
-       (lexenv-policy (node-lexenv (lvar-dest new-value))))))
+       (lexenv-policy (node-lexenv (lvar-dest new-value)))
+       :aref)))
   (lvar-type new-value))
 
 ;;; Return true if ARG is NIL, or is a constant-lvar whose
@@ -151,10 +152,10 @@
   (block nil
     (flet ((give-up (&optional reason)
              (cond ((= (length subscripts) 1)
-                    (let ((arg (sb!xc:gensym)))
-                      `(lambda (array ,arg)
-                         (and (typep ,arg '(and fixnum unsigned-byte))
-                              (< ,arg (array-dimension array 0))))))
+                    (return
+                      `(lambda (array arg)
+                         (and (typep arg '(and fixnum unsigned-byte))
+                              (< arg (array-dimension array 0))))))
                    (t
                     (give-up-ir1-transform
                      (or reason
@@ -167,9 +168,6 @@
                               (lvar-conservative-type array))
                              args)
                           (give-up (car args)))))
-        ;; Might be *. (Note: currently this is never true, because the type
-        ;; derivation infers the rank from the call to ARRAY-IN-BOUNDS-P, but
-        ;; let's keep this future proof.)
         (when (eq '* dimensions)
           (give-up "array bounds unknown"))
         ;; shortcut for zero dimensions
@@ -285,8 +283,19 @@
   (declare (ignore index))
   (assert-new-value-type new-value array))
 
+(defun check-array-dimensions (dims node)
+  (or (typep dims 'index)
+      (and (proper-list-p dims)
+           (every (lambda (x)
+                    (typep x 'index))
+                  dims))
+      (let ((*compiler-error-context* node))
+        (setf (combination-kind node) :error)
+        (compiler-warn "Bad array dimensions: ~s" dims))))
+
 (defun derive-make-array-type (dims element-type adjustable
-                               fill-pointer displaced-to)
+                               fill-pointer displaced-to
+                               node)
   (let* ((simple (and (unsupplied-or-nil adjustable)
                       (unsupplied-or-nil displaced-to)
                       (unsupplied-or-nil fill-pointer)))
@@ -307,6 +316,8 @@
                  ,(cond ((constant-lvar-p dims)
                          (let* ((val (lvar-value dims))
                                 (cdims (ensure-list val)))
+                           (unless (check-array-dimensions val node)
+                             (return-from derive-make-array-type))
                            (if simple
                                cdims
                                (length cdims))))
@@ -325,13 +336,16 @@
 
 (defoptimizer (make-array derive-type)
     ((dims &key element-type adjustable fill-pointer displaced-to
-           &allow-other-keys))
+           &allow-other-keys)
+     node)
   (derive-make-array-type dims element-type adjustable
-                          fill-pointer displaced-to))
+                          fill-pointer displaced-to
+                          node))
 
 (defoptimizer (%make-array derive-type)
     ((dims widetag n-bits &key adjustable fill-pointer displaced-to
-                          &allow-other-keys))
+           &allow-other-keys)
+     node)
   (declare (ignore n-bits))
   (let ((saetp (and (constant-lvar-p widetag)
                     (find (lvar-value widetag)
@@ -340,7 +354,8 @@
     (derive-make-array-type dims (if saetp
                                      (sb!vm:saetp-ctype saetp)
                                      *wild-type*)
-                            adjustable fill-pointer displaced-to)))
+                            adjustable fill-pointer displaced-to
+                            node)))
 
 
 ;;;; constructors
@@ -352,8 +367,7 @@
 ;;; Just convert it into a MAKE-ARRAY.
 (deftransform make-string ((length &key
                                    (element-type 'character)
-                                   (initial-element
-                                    #.*default-init-char-form*)))
+                                   (initial-element (code-char 0))))
   `(the simple-string (make-array (the index length)
                        :element-type element-type
                        ,@(when initial-element
@@ -384,7 +398,9 @@
     (return-from rewrite-initial-contents (values nil nil)))
   (let ((dimensions (make-array rank :initial-element nil))
         (output))
-    (named-let recurse ((form (sb!xc:macroexpand initial-contents env))
+    (named-let recurse ((form (handler-case (sb!xc:macroexpand initial-contents env)
+                                (error ()
+                                  (return-from rewrite-initial-contents))))
                         (axis 0))
       (flet ((make-list-ctor (tail &optional (prefix nil prefixp) &aux val)
                (when (and (sb!xc:constantp tail)
@@ -454,11 +470,14 @@
 (define-source-transform make-array (dims-form &rest rest &environment env
                                                &aux dims dims-constp)
   (cond ((and (sb!xc:constantp dims-form env)
-              (listp (setq dims (constant-form-value dims-form env)))
+              (proper-list-p (setq dims (constant-form-value dims-form env)))
               (not (singleton-p dims))
               (every (lambda (x) (typep x 'index)) dims))
          (setq dims-constp t))
-        ((and (cond ((typep (setq dims (sb!xc:macroexpand dims-form env))
+        ((and (cond ((typep (setq dims (handler-case
+                                           (sb!xc:macroexpand dims-form env)
+                                         (error ()
+                                           (return-from make-array (values nil t)))))
                             '(cons (eql list)))
                      (setq dims (cdr dims))
                      t)
@@ -581,7 +600,9 @@
       (let* ((type (constant-form-value type env))
              (length (1- (length x)))
              (ctype (careful-values-specifier-type type)))
-        (if (csubtypep ctype (specifier-type '(array * (*))))
+        (if (and ctype
+                 (neq ctype *empty-type*)
+                 (csubtypep ctype (specifier-type '(array * (*)))))
             (multiple-value-bind (type element-type upgraded had-dimensions)
                 (simplify-vector-type ctype)
               (declare (ignore type upgraded))
@@ -594,6 +615,11 @@
                                       `(:element-type ',(type-specifier element-type))))))
             (values nil t)))
       (values nil t)))
+
+(defun proper-sequence-p (sequence)
+  (if (consp sequence)
+      (proper-list-p sequence)
+      (typep sequence 'sequence)))
 
 ;;; This baby is a bit of a monster, but it takes care of any MAKE-ARRAY
 ;;; call which creates a vector with a known element type -- and tries
@@ -627,32 +653,38 @@
                        (lvar-value element-type) ; enforces const-ness.
                        t))
          (elt-ctype (ir1-transform-specifier-type elt-spec))
-         (saetp (if (unknown-type-p elt-ctype)
-                    (give-up-ir1-transform "~S is an unknown type: ~S"
-                                           :element-type elt-spec)
-                    (find-saetp-by-ctype elt-ctype)))
+         (saetp (cond ((unknown-type-p elt-ctype)
+                       (give-up-ir1-transform "~S is an unknown type: ~S"
+                                              :element-type elt-spec))
+                      ((eq elt-ctype *empty-type*)
+                       (give-up-ir1-transform))
+                      (t
+                       (find-saetp-by-ctype elt-ctype))))
          (default-initial-element (sb!vm:saetp-initial-element-default saetp))
          (n-bits (sb!vm:saetp-n-bits saetp))
          (typecode (sb!vm:saetp-typecode saetp))
          (n-pad-elements (sb!vm:saetp-n-pad-elements saetp))
          (n-words-form
-           (if c-length
-               (ceiling (* (+ c-length n-pad-elements) n-bits)
-                        sb!vm:n-word-bits)
-               (let ((padded-length-form (if (zerop n-pad-elements)
-                                             'length
-                                             `(+ length ,n-pad-elements))))
-                 (cond
-                   ((= n-bits 0) 0)
-                   ((>= n-bits sb!vm:n-word-bits)
-                    `(* ,padded-length-form
-                        ;; i.e., not RATIO
-                        ,(the fixnum (/ n-bits sb!vm:n-word-bits))))
-                   (t
-                    (let ((n-elements-per-word (/ sb!vm:n-word-bits n-bits)))
-                      (declare (type index n-elements-per-word)) ; i.e., not RATIO
-                      `(ceiling (truly-the index ,padded-length-form)
-                                ,n-elements-per-word)))))))
+           (cond ((not c-length)
+                  (let ((padded-length-form (if (zerop n-pad-elements)
+                                                'length
+                                                `(+ length ,n-pad-elements))))
+                    (cond
+                      ((= n-bits 0) 0)
+                      ((>= n-bits sb!vm:n-word-bits)
+                       `(* ,padded-length-form
+                           ;; i.e., not RATIO
+                           ,(the fixnum (/ n-bits sb!vm:n-word-bits))))
+                      (t
+                       (let ((n-elements-per-word (/ sb!vm:n-word-bits n-bits)))
+                         (declare (type index n-elements-per-word)) ; i.e., not RATIO
+                         `(ceiling (truly-the index ,padded-length-form)
+                                   ,n-elements-per-word))))))
+                 ((fixnump c-length)
+                  (ceiling (* (+ c-length n-pad-elements) n-bits)
+                           sb!vm:n-word-bits))
+                 (t
+                  (give-up-ir1-transform))))
          (data-result-spec
            `(simple-array ,(sb!vm:saetp-specifier saetp) (,(or c-length '*))))
          (result-spec
@@ -661,9 +693,6 @@
                      (not simple-array))
                `(simple-array
                  ,(sb!vm:saetp-specifier saetp) (,(or c-length '*)))))
-         (header-form (and complex
-                           `(make-array-header ,(or (sb!vm:saetp-complex-typecode saetp)
-                                                    sb!vm:complex-vector-widetag) 1)))
          (data-alloc-form
            `(truly-the ,data-result-spec
                        (allocate-vector ,typecode
@@ -693,30 +722,42 @@
                     (let* ((constant-fill-pointer-p (constant-lvar-p fill-pointer))
                            (fill-pointer-value (and constant-fill-pointer-p
                                                     (lvar-value fill-pointer))))
-                      `(let* ((header ,header-form)
-                              (data ,data-alloc-form)
-                              (data ,(or data-wrapper 'data))
-                              (length (the index ,(or c-length 'length))))
-                         (setf (%array-fill-pointer header)
-                               ,(cond ((eq fill-pointer-value t)
-                                       'length)
-                                      (fill-pointer-value)
-                                      ((and fill-pointer
-                                            (not constant-fill-pointer-p))
-                                       `(if (> fill-pointer length)
-                                            (error "Invalid fill-pointer ~a" fill-pointer)
-                                            fill-pointer))
-                                      (t
-                                       'length)))
-                         (setf (%array-fill-pointer-p header)
-                               ,(and fill-pointer
-                                     `(and fill-pointer t)))
-                         (setf (%array-available-elements header) length)
-                         (setf (%array-data-vector header) data)
-                         (setf (%array-displaced-p header) nil)
-                         (setf (%array-displaced-from header) nil)
-                         (setf (%array-dimension header 0) length)
-                         (truly-the ,result-spec header))))
+                      `(let ((%length (the index ,(or c-length 'length))))
+                         (truly-the
+                          ,result-spec
+                          (make-array-header* ,(or (sb!vm:saetp-complex-typecode saetp)
+                                                   sb!vm:complex-vector-widetag)
+                                              ;; fill-pointer
+                                              ,(cond ((eq fill-pointer-value t)
+                                                      '%length)
+                                                     (fill-pointer-value)
+                                                     ((and fill-pointer
+                                                           (not constant-fill-pointer-p))
+                                                      `(cond ((or (eq fill-pointer t)
+                                                                  (null fill-pointer))
+                                                              %length)
+                                                             ((> fill-pointer %length)
+                                                              (error "Invalid fill-pointer ~a" fill-pointer))
+                                                             (t
+                                                              fill-pointer)))
+                                                     (t
+                                                      '%length))
+                                              ;; fill-pointer-p
+                                              ,(and fill-pointer
+                                                    `(and fill-pointer t))
+                                              ;; elements
+                                              %length
+                                              ;; data
+                                              (let ((data ,data-alloc-form))
+                                                ,(or data-wrapper 'data))
+                                              ;; displacement
+                                              0
+                                              ;; displaced-p
+                                              nil
+                                              ;; displaced-from
+                                              nil
+                                              ;; dimensions
+                                              %length)))))
                    (data-wrapper
                     (subst data-alloc-form 'data data-wrapper))
                    (t
@@ -758,7 +799,9 @@
                   ;; To make matters worse, the time grows superlinearly,
                   ;; and it's not entirely obvious that passing a constant array
                   ;; of 100x100 things is responsible for such an explosion.
-                  (<= (length (lvar-value initial-contents)) 1000))
+                  (let ((initial-contents (lvar-value initial-contents)))
+                    (and (proper-sequence-p initial-contents)
+                         (<= (length initial-contents) 1000))))
              (let ((contents (lvar-value initial-contents)))
                (unless (= c-length (length contents))
                  (abort-ir1-transform "~S has ~S elements, vector length is ~S."
@@ -821,7 +864,11 @@
                                     elt-spec))
                     ;; For the default initial element, only warn if
                     ;; any array elements are initialized using it.
-                    ((not (eql c-length 0))
+                    ((and (not (eql c-length 0))
+                          ;; If it's coming from the source transform,
+                          ;; then fill-array means it was supplied initial-contents
+                          (not (lvar-matches-calls (combination-lvar call)
+                                                   '(make-array-header* fill-array))))
                      (compiler-style-warn "The default initial element ~S is not a ~S."
                                           default-initial-element
                                           elt-spec))))
@@ -957,6 +1004,9 @@
       (let* ((args (splice-fun-args dims :any 2)) ; the args to CONS
              (dummy (cadr args)))
         (flush-dest dummy)
+        ;; Don't want (list (list x)) to become a valid dimension specifier.
+        (assert-lvar-type (car args) (specifier-type 'index)
+                          (%coerce-to-policy call))
         (setf (combination-args call) (delete dummy (combination-args call)))
         (return-from make-array
           (transform-make-array-vector (car args)
@@ -973,12 +1023,11 @@
           (element-type-ctype (and (constant-lvar-p element-type)
                                    (ir1-transform-specifier-type
                                     (lvar-value element-type)))))
-      (when (contains-unknown-type-p element-type-ctype)
+      (when (or (contains-unknown-type-p element-type-ctype)
+                (not (proper-list-p dims)))
         (give-up-ir1-transform))
-      (unless (every (lambda (x) (typep x '(integer 0))) dims)
-        (give-up-ir1-transform
-         "The dimension list contains something other than an integer: ~S"
-         dims))
+      (unless (check-array-dimensions dims call)
+          (give-up-ir1-transform))
       (cond ((singleton-p dims)
              (transform-make-array-vector (car dims) element-type
                                           initial-element initial-contents call
@@ -1005,30 +1054,34 @@
                                      (lvar-value element-type)))
                                    (t '*))
                             ,(make-list rank :initial-element '*))))
-               `(let ((header (make-array-header ,(if complex
-                                                      sb!vm:complex-array-widetag
-                                                      sb!vm:simple-array-widetag)
-                                                 ,rank))
-                      (data (make-array ,total-size
-                                        ,@(when element-type
-                                            '(:element-type element-type))
-                                        ,@(when initial-element
-                                            '(:initial-element initial-element)))))
-                  ,@(when initial-contents
-                      ;; FIXME: This is could be open coded at least a bit too
-                      `((fill-data-vector data ',dims initial-contents)))
-                  (setf (%array-fill-pointer header) ,total-size)
-                  (setf (%array-fill-pointer-p header) nil)
-                  (setf (%array-available-elements header) ,total-size)
-                  (setf (%array-data-vector header) data)
-                  (setf (%array-displaced-p header) nil)
-                  (setf (%array-displaced-from header) nil)
-                  ,@(let ((axis -1))
-                      (mapcar (lambda (dim)
-                                `(setf (%array-dimension header ,(incf axis))
-                                       ,dim))
-                              dims))
-                  (truly-the ,spec header))))))))
+               `(truly-the ,spec
+                           (make-array-header* ,(if complex
+                                                    sb!vm:complex-array-widetag
+                                                    sb!vm:simple-array-widetag)
+                                               ;; fill-pointer
+                                               ,total-size
+                                               ;; fill-pointer-p
+                                               nil
+                                               ;; elements
+                                               ,total-size
+                                               ;; data
+                                               (let ((data (make-array ,total-size
+                                                                       ,@(when element-type
+                                                                           '(:element-type element-type))
+                                                                       ,@(when initial-element
+                                                                           '(:initial-element initial-element)))))
+                                                 ,(if initial-contents
+                                                      ;; FIXME: This is could be open coded at least a bit too
+                                                      `(fill-data-vector data ',dims initial-contents)
+                                                      'data))
+                                               ;; displacement
+                                               0
+                                               ;; displaced-p
+                                               nil
+                                               ;; displaced-from
+                                               nil
+                                               ;; dimensions
+                                               ,@dims))))))))
 
 (deftransform make-array ((dims &key element-type initial-element initial-contents
                                      adjustable fill-pointer)
@@ -1088,44 +1141,55 @@
 ;;; maybe this is just too sloppy for actual type logic.  -- CSR,
 ;;; 2004-02-18
 (defun array-type-dimensions-or-give-up (type)
-  (labels ((maybe-array-type-dimensions (type)
-             (typecase type
-               (array-type
-                (array-type-dimensions type))
-               (union-type
-                (let* ((types (loop for type in (union-type-types type)
-                                    for dimensions = (maybe-array-type-dimensions type)
-                                    when (eq dimensions '*)
-                                    do
-                                    (return-from maybe-array-type-dimensions '*)
-                                    when dimensions
-                                    collect it))
-                       (result (car types))
-                       (length (length result))
-                       (complete-match t))
-                  (dolist (other (cdr types))
-                    (when (/= length (length other))
-                      (give-up-ir1-transform
-                       "~@<dimensions of arrays in union type ~S do not match~:@>"
-                       (type-specifier type)))
-                    (unless (equal result other)
-                      (setf complete-match nil)))
-                  (if complete-match
-                      result
-                      (make-list length :initial-element '*))))
-               (intersection-type
-                (let* ((types (remove nil (mapcar #'maybe-array-type-dimensions
-                                                  (intersection-type-types type))))
-                       (result (car types)))
-                  (dolist (other (cdr types) result)
-                    (unless (equal result other)
-                      (abort-ir1-transform
-                       "~@<dimensions of arrays in intersection type ~S do not match~:@>"
-                       (type-specifier type)))))))))
-    (or (maybe-array-type-dimensions type)
-        (give-up-ir1-transform
-         "~@<don't know how to extract array dimensions from type ~S~:@>"
-         (type-specifier type)))))
+  (let ((no-dimension '#:no))
+    (labels ((maybe-array-type-dimensions (type)
+               (typecase type
+                 (array-type
+                  (array-type-dimensions type))
+                 (union-type
+                  (let* ((types (loop for type in (union-type-types type)
+                                      for dimensions = (maybe-array-type-dimensions type)
+                                      when (eq dimensions no-dimension)
+                                      do (return-from maybe-array-type-dimensions no-dimension)
+                                      when (eq dimensions '*)
+                                      do
+                                      (return-from maybe-array-type-dimensions '*)
+                                      unless (eq dimensions no-dimension)
+                                      collect dimensions))
+                         (result (car types))
+                         (length (length result))
+                         (complete-match t))
+                    (dolist (other (cdr types))
+                      (when (/= length (length other))
+                        (give-up-ir1-transform
+                         "~@<dimensions of arrays in union type ~S do not match~:@>"
+                         (type-specifier type)))
+                      (unless (equal result other)
+                        (setf complete-match nil)))
+                    (if complete-match
+                        result
+                        (make-list length :initial-element '*))))
+                 (intersection-type
+                  (let* ((types (remove no-dimension
+                                        (mapcar #'maybe-array-type-dimensions
+                                                (intersection-type-types type))))
+                         (result (car types)))
+                    (dolist (other (cdr types))
+                      (unless (equal result other)
+                        (abort-ir1-transform
+                         "~@<dimensions of arrays in intersection type ~S do not match~:@>"
+                         (type-specifier type))))
+                    (if types
+                        result
+                        no-dimension)))
+                 (t
+                  no-dimension))))
+      (let ((dim (maybe-array-type-dimensions type)))
+        (if (eq dim no-dimension)
+            (give-up-ir1-transform
+             "~@<don't know how to extract array dimensions from type ~S~:@>"
+             (type-specifier type))
+            dim)))))
 
 (defun conservative-array-type-complexp (type)
   (typecase type
@@ -1205,41 +1269,42 @@
     (give-up-ir1-transform "The axis is not constant."))
   ;; Dimensions may change thanks to ADJUST-ARRAY, so we need the
   ;; conservative type.
-  (let ((array-type (lvar-conservative-type array))
-        (axis (lvar-value axis)))
-    (let ((dims (array-type-dimensions-or-give-up array-type)))
-      (unless (listp dims)
-        (give-up-ir1-transform
-         "The array dimensions are unknown; must call ARRAY-DIMENSION at runtime."))
-      (unless (> (length dims) axis)
-        (abort-ir1-transform "The array has dimensions ~S, ~W is too large."
-                             dims
-                             axis))
-      (let ((dim (nth axis dims)))
-        (cond ((integerp dim)
-               dim)
-              ((= (length dims) 1)
-               (ecase (conservative-array-type-complexp array-type)
-                 ((t)
-                  '(%array-dimension array 0))
-                 ((nil)
-                  '(vector-length array))
-                 ((:maybe)
-                  `(if (array-header-p array)
-                       (%array-dimension array axis)
-                       (vector-length array)))))
-              (t
-               '(%array-dimension array axis)))))))
+  (let* ((array-type (lvar-conservative-type array))
+         (axis (lvar-value axis))
+         (dims (array-type-dimensions-or-give-up array-type)))
+    (unless (listp dims)
+      (give-up-ir1-transform
+       "The array dimensions are unknown; must call ARRAY-DIMENSION at runtime."))
+    (unless (> (length dims) axis)
+      (abort-ir1-transform "The array has dimensions ~S, ~W is too large."
+                           dims
+                           axis))
+    (let ((dim (nth axis dims)))
+      (cond ((integerp dim)
+             dim)
+            ((= (length dims) 1)
+             (ecase (conservative-array-type-complexp array-type)
+               ((t)
+                '(%array-dimension array 0))
+               ((nil)
+                '(vector-length array))
+               ((:maybe)
+                `(if (array-header-p array)
+                     (%array-dimension array axis)
+                     (vector-length array)))))
+            (t
+             '(%array-dimension array axis))))))
 
-;;; If the length has been declared and it's simple, just return it.
-(deftransform length ((vector)
-                      ((simple-array * (*))))
-  (let ((type (lvar-type vector)))
-    (let ((dims (array-type-dimensions-or-give-up type)))
-      (unless (and (listp dims) (integerp (car dims)))
-        (give-up-ir1-transform
-         "Vector length is unknown, must call LENGTH at runtime."))
-      (car dims))))
+(deftransform %array-dimension ((array axis)
+                                (array (constant-arg index)))
+  (let* ((array-type (lvar-conservative-type array))
+         (dims (array-type-dimensions-or-give-up array-type))
+         (axis (lvar-value axis))
+         (dim (and (listp dims)
+                   (nth axis dims))))
+    (if (integerp dim)
+        dim
+        (give-up-ir1-transform))))
 
 ;;; All vectors can get their length by using VECTOR-LENGTH. If it's
 ;;; simple, it will extract the length slot from the vector. It it's
@@ -1251,13 +1316,36 @@
 ;;; If a simple array with known dimensions, then VECTOR-LENGTH is a
 ;;; compile-time constant.
 (deftransform vector-length ((vector))
-  (let ((vtype (lvar-type vector)))
-    (let ((dim (first (array-type-dimensions-or-give-up vtype))))
-      (when (eq dim '*)
-        (give-up-ir1-transform))
-      (when (conservative-array-type-complexp vtype)
-        (give-up-ir1-transform))
-      dim)))
+  (let* ((vtype (lvar-type vector))
+         (dim (first (array-type-dimensions-or-give-up vtype))))
+    (when (eq dim '*)
+      (give-up-ir1-transform))
+    (when (conservative-array-type-complexp vtype)
+      (give-up-ir1-transform))
+    dim))
+
+(defoptimizer (vector-length derive-type) ((vector))
+  (let ((array-type (lvar-conservative-type vector))
+        min-length
+        max-length)
+    (when (and
+           (union-type-p array-type)
+           (loop for type in (union-type-types array-type)
+                 always (and (array-type-p type)
+                             (typep (array-type-dimensions type)
+                                    '(cons integer null)))
+                 do (let ((length (car (array-type-dimensions type))))
+                      (cond ((array-type-complexp type)
+                             ;; fill-pointer can start from 0
+                             (setf min-length 0))
+                            ((or (not min-length)
+                                 (< length min-length))
+                             (setf min-length length)))
+                      (when (or (not max-length)
+                                (> length max-length))
+                        (setf max-length length)))))
+      (specifier-type `(integer ,(or min-length 0)
+                                ,max-length)))))
 
 ;;; Again, if we can tell the results from the type, just use it.
 ;;; Otherwise, if we know the rank, convert into a computation based
@@ -1277,23 +1365,44 @@
 
 ;;; Only complex vectors have fill pointers.
 (deftransform array-has-fill-pointer-p ((array))
-  (let ((array-type (lvar-type array)))
-    (let ((dims (array-type-dimensions-or-give-up array-type)))
-      (if (and (listp dims) (not (= (length dims) 1)))
-          nil
-          (ecase (conservative-array-type-complexp array-type)
-            ((t)
-             t)
-            ((nil)
-             nil)
-            ((:maybe)
-             (give-up-ir1-transform
-              "The array type is ambiguous; must call ~
-               ARRAY-HAS-FILL-POINTER-P at runtime.")))))))
+  (let* ((array-type (lvar-type array))
+         (dims (array-type-dimensions-or-give-up array-type)))
+    (if (and (listp dims) (not (= (length dims) 1)))
+        nil
+        (ecase (conservative-array-type-complexp array-type)
+          ((t)
+           t)
+          ((nil)
+           nil)
+          ((:maybe)
+           (give-up-ir1-transform
+            "The array type is ambiguous; must call ~
+               ARRAY-HAS-FILL-POINTER-P at runtime."))))))
 
-(deftransform check-bound ((array dimension index) * * :node node)
-  ;; This is simply to avoid multiple evaluation of INDEX by the
-  ;; translator, it's easier to wrap it in a lambda from DEFTRANSFORM
+(deftransform %check-bound ((array dimension index) ((simple-array * (*)) * *))
+  (let ((array-ref (lvar-uses array))
+        (index-ref (lvar-uses index)))
+    (unless (and
+             (ref-p array-ref)
+             (ref-p index-ref)
+             (or
+              (loop for constraint in (ref-constraints array-ref)
+                    thereis (and (eq (constraint-y constraint)
+                                     (ref-leaf index-ref))))
+              (loop for constraint in (ref-constraints index-ref)
+                    thereis (and (eq (constraint-y constraint)
+                                     (ref-leaf array-ref))))))
+      (give-up-ir1-transform)))
+  ;; It's in bounds but it may be of the wrong type
+  `(the (and fixnum unsigned-byte) index))
+
+(deftransform check-bound ((array dimension index))
+  ;; %CHECK-BOUND will perform both bound and type checking when
+  ;; necessary, delete the cast so that it doesn't get confused by
+  ;; its derived type.
+  (let ((use (principal-lvar-ref-use index)))
+    (when (array-index-cast-p use)
+      (delete-cast use)))
   `(bound-cast array ,(if (constant-lvar-p dimension)
                           (lvar-value dimension)
                           'dimension)
@@ -1384,9 +1493,9 @@
                      `(sequence-bounding-indices-bad-error ,array ,start ,end)
                      `(array-bounding-indices-bad-error ,array ,start ,end)))))
        (do ((,data ,(if array-header-p
-                        `(%array-data-vector ,array)
+                        `(%array-data ,array)
                         array)
-                   (%array-data-vector ,data))
+                   (%array-data ,data))
             (,cumulative-offset ,(if array-header-p
                                      `(%array-displacement ,array)
                                      0)
@@ -1416,14 +1525,14 @@
         ;; similar.
         (if check-bounds
             `(let* ((data (truly-the (simple-array ,element-type (*))
-                                     (%array-data-vector array)))
+                                     (%array-data array)))
                     (len (length data))
                     (real-end (or end len)))
                (unless (<= 0 start data-end lend)
                  (sequence-bounding-indices-bad-error array start end))
                (values data 0 real-end 0))
             `(let ((data (truly-the (simple-array ,element-type (*))
-                                    (%array-data-vector array))))
+                                    (%array-data array))))
                (values data 0 (or end (length data)) 0)))
         `(%with-array-data-macro array start end
                                  :check-fill-pointer ,check-fill-pointer
@@ -1508,7 +1617,11 @@
     (with-unique-names (n-vector)
       `(let ((,n-vector ,vector))
          (truly-the ,elt-type (data-vector-set
-                               (the simple-vector ,n-vector)
+                               (the simple-vector
+                                    (with-annotations
+                                        (,(make-lvar-modified-annotation :caller
+                                                                         '(setf svref)))
+                                      ,n-vector))
                                (check-bound ,n-vector (length ,n-vector) ,index)
                                (the ,elt-type ,value)))))))
 
@@ -1570,7 +1683,7 @@
 
   (deftransform (setf aref) ((new-value array &rest subscripts))
     (with-row-major-index (array subscripts index new-value)
-                          (hairy-data-vector-set array index new-value))))
+      (hairy-data-vector-set array index new-value))))
 
 ;; For AREF of vectors we do the bounds checking in the callee. This
 ;; lets us do a significantly more efficient check for simple-arrays
@@ -1698,7 +1811,9 @@
 ;;; Pick off some constant cases.
 (defoptimizer (array-header-p derive-type) ((array))
   (let ((type (lvar-type array)))
-    (cond ((not (array-type-p type))
+    (cond ((not (types-equal-or-intersect type (specifier-type 'simple-array)))
+           (specifier-type '(eql t)))
+          ((not (array-type-p type))
            ;; FIXME: use analogue of ARRAY-TYPE-DIMENSIONS-OR-GIVE-UP
            nil)
           (t
@@ -1713,3 +1828,8 @@
                     (specifier-type '(eql t)))
                    (t
                     nil)))))))
+
+(defoptimizer (array-header-p constraint-propagate-if)
+    ((array) node gen)
+  (declare (ignore gen))
+  (values array (specifier-type '(and array (not (simple-array * (*)))))))

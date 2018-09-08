@@ -79,6 +79,11 @@
   (defregset non-descriptor-regs
       nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8 nl9 nargs nfp ocfp)
 
+  ;; OAOOM: Same as runtime/arm64-lispregs.h
+  (defregset boxed-regs
+      r0 r1 r2 r3 r4 r5 r6
+      r7 r8 r9 #!-sb-thread r10 #!+sb-thread thread lexenv code)
+
   ;; registers used to pass arguments
   ;;
   ;; the number of arguments/return values passed in registers
@@ -90,12 +95,14 @@
 
 ;;;; SB and SC definition:
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 32)
 (define-storage-base control-stack :unbounded :size 2 :size-increment 1)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
 (define-storage-base float-registers :finite :size 32)
+)
 
 (!define-storage-classes
   ;; Non-immediate contstants in the constant pool
@@ -219,7 +226,7 @@
 (macrolet ((defregtn (name sc)
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
-                 `(defparameter ,tn-sym
+                 `(defglobal ,tn-sym
                    (make-random-tn :kind :normal
                     :sc (sc-or-lose ',sc)
                     :offset ,offset-sym)))))
@@ -244,24 +251,24 @@
 (defun immediate-constant-sc (value)
   (typecase value
     (null
-     (sc-number-or-lose 'null))
+     null-sc-number)
     ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(defconstant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 ;;; offsets of special stack frame locations
 (defconstant ocfp-save-offset 0)
@@ -317,14 +324,14 @@
            (values :default nil)))
       (logbitp
        (cond
-         ((or (valid-funtype '((constant-arg (integer 0 #.(1- n-word-bits))) signed-word) '*)
-              (valid-funtype '((constant-arg (integer 0 #.(1- n-word-bits))) word) '*))
+         ((or (valid-funtype '((constant-arg (mod #.n-word-bits)) signed-word) '*)
+              (valid-funtype '((constant-arg (mod #.n-word-bits)) word) '*))
           (values :transform '(lambda (index integer)
                                (%logbitp integer index))))
          (t (values :default nil))))
       (%ldb
        (flet ((validp (type width)
-                (and (valid-funtype `((constant-arg (mod ,width))
+                (and (valid-funtype `((constant-arg (integer 1 ,(1- width)))
                                       (constant-arg (mod ,width))
                                       ,type)
                                     'unsigned-byte)
@@ -343,7 +350,7 @@
       (%dpb
        (flet ((validp (type result-type)
                 (valid-funtype `(,type
-                                 (constant-arg (mod ,n-word-bits))
+                                 (constant-arg (integer 1 ,(1- n-word-bits)))
                                  (constant-arg (mod ,n-word-bits))
                                  ,type)
                                result-type)))
@@ -362,3 +369,11 @@
   (make-random-tn :kind :normal
                   :sc (sc-or-lose '32-bit-reg)
                   :offset (tn-offset tn)))
+
+;;; null-tn will be used for setting it, just check the lowtag
+#!+sb-thread
+(defconstant pseudo-atomic-flag
+    (ash list-pointer-lowtag #!+little-endian 0 #!+big-endian 32))
+#!+sb-thread
+(defconstant pseudo-atomic-interrupted-flag
+    (ash list-pointer-lowtag #!+little-endian 32 #!+big-endian 0))

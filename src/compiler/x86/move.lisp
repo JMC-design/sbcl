@@ -63,8 +63,6 @@
                (not (or (location= x y)
                         (and (sc-is x any-reg descriptor-reg immediate)
                              (sc-is y control-stack))))))
-  (:effects)
-  (:affected)
   (:generator 0
     (if (and (sc-is x immediate)
              (sc-is y any-reg descriptor-reg control-stack))
@@ -218,6 +216,22 @@
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
 
+(define-vop (move-from-fixnum+1)
+  (:args (x :scs (signed-reg unsigned-reg)))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:generator 4
+    (inst imul y x (ash 1 n-fixnum-tag-bits))
+    (inst jmp :no done)
+    (inst mov y (emit-constant (1+ sb!xc:most-positive-fixnum)))
+    done))
+
+(define-vop (move-from-fixnum-1 move-from-fixnum+1)
+  (:generator 4
+    (inst imul y x (ash 1 n-fixnum-tag-bits))
+    (inst jmp :no done)
+    (inst mov y (emit-constant (1- sb!xc:most-negative-fixnum)))
+    done))
+
 ;;; Convert an untagged unsigned word to a lispobj -- fixnum or bignum
 ;;; as the case may be. Fixnum case inline, bignum case in an assembly
 ;;; routine.
@@ -259,8 +273,6 @@
                (not (or (location= x y)
                         (and (sc-is x signed-reg unsigned-reg)
                              (sc-is y signed-stack unsigned-stack))))))
-  (:effects)
-  (:affected)
   (:note "word integer move")
   (:generator 0
     (move y x)))

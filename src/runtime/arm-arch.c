@@ -73,7 +73,7 @@ boolean arch_pseudo_atomic_atomic(os_context_t *context)
 
 void arch_set_pseudo_atomic_interrupted(os_context_t *context)
 {
-    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED, do_pending_interrupt, 0);
+    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED, (lispobj)do_pending_interrupt, 0);
 }
 
 void arch_clear_pseudo_atomic_interrupted(os_context_t *context)
@@ -134,8 +134,12 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
 
 #define LINKAGE_TEMP_REG        reg_NFP
 
-void arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+void arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+  if (datap) {
+    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
+    return;
+  }
   /*
     ldr reg, [pc, #4]
     bx  reg
@@ -164,15 +168,8 @@ void arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
   *inst_ptr++ = inst;
 
   // address
-  *inst_ptr++ = target_addr;
+  *inst_ptr++ = (int)target_addr;
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
-
-void
-arch_write_linkage_table_ref(void * reloc_addr, void *target_addr)
-{
-    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-}
-
 #endif

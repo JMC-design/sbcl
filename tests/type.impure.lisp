@@ -9,10 +9,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(use-package "ASSERTOID")
-(use-package "TEST-UTIL")
-
 (defmacro assert-nil-nil (expr)
   `(assert (equal '(nil nil) (multiple-value-list ,expr))))
 (defmacro assert-nil-t (expr)
@@ -780,15 +776,6 @@
 
 ;;; Array type unions have some tricky semantics.
 
-;; borrowed from 'info.impure.lisp' - FIXME: put in test-util
-;; and make it accept with either lists or vectors.
-(defun shuffle (list)
-  (let ((vector (coerce list 'vector)))
-    (loop for lim from (1- (length vector)) downto 0
-          for chosen = (random (1+ lim))
-          do (rotatef (aref vector chosen) (aref vector lim)))
-    (coerce vector 'list)))
-
 (macrolet
     ((disunity-test (name type-specifier-1 type-specifier-2)
        `(with-test (:name ,name)
@@ -942,11 +929,9 @@
   ;; Ensure we don't pessimize rank 1 specialized array.
   ;; (SIMPLE unboxed vector is done differently)
   (let* ((hair (sb-kernel:specifier-type '(sb-kernel:unboxed-array 1)))
-         (xform (sb-c::source-transform-union-typep 'myobj hair))
-         (g (caar (cadr xform)))) ; (LET ((#:g MYOBJ)) ...)
+         (xform (sb-c::source-transform-union-typep 'myobj hair)))
     (assert (equal xform
-                   `(let ((,g myobj))
-                      (or (typep ,g '(and vector (not (array t)))))))))
+                   '(or (typep myobj '(and vector (not (array t))))))))
 
   ;; Exclude one subtype at a time and make sure they all work.
   (dotimes (i (length sb-vm:*specialized-array-element-type-properties*))
@@ -959,13 +944,11 @@
                   unless (eql i j)
                   collect `(array ,(sb-vm:saetp-specifier x))))
            (xform
-            (sb-c::source-transform-union-typep 'myobj
-             (sb-kernel:specifier-type `(or ,@(shuffle hair) fixnum))))
-           (g (caar (cadr xform)))) ; (LET ((#:g MYOBJ)) ...)
+             (sb-c::source-transform-union-typep 'myobj
+             (sb-kernel:specifier-type `(or ,@(shuffle hair) fixnum)))))
       (assert (equal xform
-                     `(let ((,g myobj))
-                        (or (typep ,g '(and array (not (array ,excluded-type))))
-                            (typep ,g 'fixnum))))))))
+                     `(or (typep myobj '(and array (not (array ,excluded-type))))
+                          (typep myobj 'fixnum)))))))
 
 (with-test (:name :interned-type-specifiers)
   ;; In general specifiers can repeatedly parse the same due to

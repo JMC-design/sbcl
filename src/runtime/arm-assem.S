@@ -111,7 +111,7 @@ call_into_lisp:
 
 	.align 3
 	.equ	.lra, .+OTHER_POINTER_LOWTAG
-	.word	RETURN_PC_HEADER_WIDETAG
+	.word	RETURN_PC_WIDETAG
 
 	@@ Correct stack pointer for return processing.
 	streq	reg_OCFP, STATIC_SYMBOL_VALUE(CONTROL_STACK_POINTER)
@@ -205,14 +205,14 @@ call_into_c:
 	ldr	reg_NFP, .frame_pointer_address
 	str	reg_R0, [reg_NFP]
 
+	@@ Set FFCA, so the runtime knows that we're not "in lisp".
+	ldr     reg_NFP, =foreign_function_call_active
+	str     pc, [reg_NFP]
+
         @@ We're done with R0, and we need to use OCFP when leaving
         @@ pseudo-atomic, so move the first of the C register
 	@@ arguments to its final resting place now.
         mov     r0, reg_OCFP
-
-	@@ Set FFCA, so the runtime knows that we're not "in lisp".
-	ldr     reg_NFP, =foreign_function_call_active
-	str     pc, [reg_NFP]
 
 #ifndef LISP_FEATURE_GENCGC
         @@ Copy the current allocation pointer out from the symbol.
@@ -372,4 +372,9 @@ do_pending_interrupt:
         .byte 0
         .byte 0
 	bx	lr
+#endif
+
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
 #endif

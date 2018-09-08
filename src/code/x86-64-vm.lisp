@@ -10,34 +10,7 @@
 ;;;; files for more information.
 
 (in-package "SB!VM")
-
-;;;; OS-CONTEXT-T
-
-;;; a POSIX signal context, i.e. the type passed as the third
-;;; argument to an SA_SIGACTION-style signal handler
-;;;
-;;; The real type does have slots, but at Lisp level, we never
-;;; access them, or care about the size of the object. Instead, we
-;;; always refer to these objects by pointers handed to us by the C
-;;; runtime library, and ask the runtime library any time we need
-;;; information about the contents of one of these objects. Thus, it
-;;; works to represent this as an object with no slots.
-;;;
-;;; KLUDGE: It would be nice to have a type definition analogous to
-;;; C's "struct os_context_t;", for an incompletely specified object
-;;; which can only be referred to by reference, but I don't know how
-;;; to do that in the FFI, so instead we just this bogus no-slots
-;;; representation. -- WHN 20000730
-;;;
-;;; FIXME: Since SBCL, unlike CMU CL, uses this as an opaque type,
-;;; it's no longer architecture-dependent, and probably belongs in
-;;; some other package, perhaps SB-KERNEL.
-(define-alien-type os-context-t (struct os-context-t-struct))
-
-;;;; MACHINE-TYPE
-
 (defun machine-type ()
-  #!+sb-doc
   "Return a string describing the type of the local machine."
   "X86-64")
 
@@ -45,28 +18,32 @@
 
 ;;; This gets called by LOAD to resolve newly positioned objects
 ;;; with things (like code instructions) that have to refer to them.
-(defun fixup-code-object (code offset fixup kind)
-  (declare (type index offset)
-           (type (member :absolute :absolute64 :relative) kind))
-  (without-gcing
-    (let ((sap (truly-the system-area-pointer
-                          (code-instructions code))))
-      (ecase kind
+;;; Return :ABSOLUTE if an absolute fixup needs to be recorded in %CODE-FIXUPS,
+;;; and return :RELATIVE if a relative fixup needs to be recorded.
+;;; The code object we're fixing up is pinned whenever this is called.
+(defun fixup-code-object (code offset fixup kind flavor)
+  (declare (type index offset) (ignorable flavor))
+  (let* ((sap (code-instructions code))
+         (fixup (+ (if (eq kind :absolute64)
+                       (signed-sap-ref-64 sap offset)
+                       (signed-sap-ref-32 sap offset))
+                   fixup)))
+    (ecase kind
         (:absolute64
          ;; Word at sap + offset contains a value to be replaced by
          ;; adding that value to fixup.
-         (setf (sap-ref-64 sap offset) (+ fixup (sap-ref-64 sap offset))))
+         (setf (sap-ref-64 sap offset) fixup))
         (:absolute
          ;; Word at sap + offset contains a value to be replaced by
          ;; adding that value to fixup.
-         (setf (sap-ref-32 sap offset) (+ fixup (signed-sap-ref-32 sap offset))))
+         (setf (sap-ref-32 sap offset) fixup))
         (:relative
          ;; Fixup is the actual address wanted.
          ;; Replace word with value to add to that loc to get there.
          ;; In the #!-immobile-code case, there's nothing to assert.
          ;; Relative fixups pretty much can't happen.
          #!+immobile-code
-         (unless (<= immobile-space-start (get-lisp-obj-address code) immobile-space-end)
+         (unless (immobile-space-obj-p code)
            (error "Can't compute fixup relative to movable object ~S" code))
          (setf (signed-sap-ref-32 sap offset)
                (etypecase fixup
@@ -74,79 +51,41 @@
                   ;; JMP/CALL are relative to the next instruction,
                   ;; so add 4 bytes for the size of the displacement itself.
                   (- fixup
-                     (the (unsigned-byte 64) (+ (sap-int sap) offset 4))))))))))
-    nil)
+                     (the (unsigned-byte 64) (+ (sap-int sap) offset 4)))))))))
+  ;; An absolute fixup is stored in the code header's %FIXUPS slot if it
+  ;; references an immobile-space (but not static-space) object.
+  ;; Note that:
+  ;;  (1) Call fixups occur in both :RELATIVE and :ABSOLUTE kinds.
+  ;;      We can ignore the :RELATIVE kind, except for foreign call.
+  ;;  (2) :STATIC-CALL fixups point to immobile space, not static space.
+  #!+immobile-space
+  (return-from fixup-code-object
+    (case flavor
+      ((:named-call :layout :immobile-object ; -> fixedobj subspace
+        :assembly-routine :assembly-routine* :static-call) ; -> varyobj subspace
+       (if (eq kind :absolute) :absolute))
+      (:foreign
+       ;; linkage-table calls using the "CALL rel32" format need to be saved,
+       ;; because the linkage table resides at a fixed address.
+       ;; Space defragmentation can handle the fixup automatically,
+       ;; but core relocation can't - it can't find all the call sites.
+       (if (eq kind :relative) :relative))))
+  nil) ; non-immobile-space builds never record code fixups
 
-;;;; low-level signal context access functions
-;;;;
-;;;; Note: In CMU CL, similar functions were hardwired to access
-;;;; BSD-style sigcontext structures defined as alien objects. Our
-;;;; approach is different in two ways:
-;;;;   1. We use POSIX SA_SIGACTION-style signals, so our context is
-;;;;      whatever the void pointer in the sigaction handler dereferences
-;;;;      to, not necessarily a sigcontext.
-;;;;   2. We don't try to maintain alien definitions of the context
-;;;;      structure at Lisp level, but instead call alien C functions
-;;;;      which take care of access for us. (Since the C functions can
-;;;;      be defined in terms of system standard header files, they
-;;;;      should be easier to maintain; and since Lisp code uses signal
-;;;;      contexts only in interactive or exception code (like the debugger
-;;;;      and internal error handling) the extra runtime cost should be
-;;;;      negligible.
-
-(declaim (inline context-pc-addr))
-(define-alien-routine ("os_context_pc_addr" context-pc-addr) (* unsigned)
-  ;; (Note: Just as in CONTEXT-REGISTER-ADDR, we intentionally use an
-  ;; 'unsigned *' interpretation for the 32-bit word passed to us by
-  ;; the C code, even though the C code may think it's an 'int *'.)
-  (context (* os-context-t)))
-
-(declaim (inline context-pc))
-(defun context-pc (context)
-  (declare (type (alien (* os-context-t)) context))
-  (let ((addr (context-pc-addr context)))
-    (declare (type (alien (* unsigned)) addr))
-    (int-sap (deref addr))))
-
-(declaim (inline context-register-addr))
-(define-alien-routine ("os_context_register_addr" context-register-addr)
-  (* unsigned)
-  ;; (Note the mismatch here between the 'int *' value that the C code
-  ;; may think it's giving us and the 'unsigned *' value that we
-  ;; receive. It's intentional: the C header files may think of
-  ;; register values as signed, but the CMU CL code tends to think of
-  ;; register values as unsigned, and might get bewildered if we ask
-  ;; it to work with signed values.)
-  (context (* os-context-t))
-  (index int))
-
-#!+(or linux win32)
+#!+(or darwin linux openbsd win32)
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
   (* unsigned) (context (* os-context-t)) (index int))
-
-(declaim (inline context-register))
-(defun context-register (context index)
-  (declare (type (alien (* os-context-t)) context))
-  (let ((addr (context-register-addr context index)))
-    (declare (type (alien (* unsigned)) addr))
-    (deref addr)))
-
-(defun %set-context-register (context index new)
-  (declare (type (alien (* os-context-t)) context))
-  (let ((addr (context-register-addr context index)))
-    (declare (type (alien (* unsigned)) addr))
-    (setf (deref addr) new)))
 
 ;;; This is like CONTEXT-REGISTER, but returns the value of a float
 ;;; register. FORMAT is the type of float to return.
 
 (defun context-float-register (context index format)
   (declare (ignorable context index))
-  #!-(or linux win32)
+  #!-(or darwin linux openbsd win32)
   (progn
     (warn "stub CONTEXT-FLOAT-REGISTER")
     (coerce 0 format))
-  #!+(or linux win32)
+  #!+(or darwin linux openbsd win32)
   (let ((sap (alien-sap (context-float-register-addr context index))))
     (ecase format
       (single-float
@@ -211,20 +150,149 @@
 ;;; arguments from the instruction stream.
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
-  (/show0 "entering INTERNAL-ERROR-ARGS, CONTEXT=..")
-  (/hexstr context)
   (let* ((pc (context-pc context))
          (trap-number (sap-ref-8 pc 0)))
     (declare (type system-area-pointer pc))
-    (/show0 "got PC")
-    ;; using INT3 the pc is .. INT3 <here> code length bytes...
     (if (= trap-number invalid-arg-count-trap)
         (values #.(error-number-or-lose 'invalid-arg-count-error)
                 '(#.arg-count-sc))
-        (let ((error-number (sap-ref-8 pc 1)))
-          (values error-number
-                  (sb!kernel::decode-internal-error-args (sap+ pc 2) error-number))))))
+        (sb!kernel::decode-internal-error-args (sap+ pc 1) trap-number))))
 
 
-;;; the current alien stack pointer; saved/restored for non-local exits
-(defvar *alien-stack-pointer*)
+#!+immobile-code
+(progn
+(defun fun-immobilize (fun)
+  (let ((code (truly-the (values code-component &optional)
+                         (sb!vm::alloc-immobile-trampoline))))
+    (setf (%code-debug-info code) fun)
+    (let ((sap (code-instructions code))
+          (ea (+ (logandc2 (get-lisp-obj-address code) lowtag-mask)
+                 (ash code-debug-info-slot word-shift))))
+      ;; For a funcallable-instance, the instruction sequence is:
+      ;;    MOV RAX, [RIP-n] ; load the function
+      ;;    MOV RAX, [RAX+5] ; load the funcallable-instance-fun
+      ;;    JMP [RAX-3]
+      ;; Otherwise just instructions 1 and 3 will do.
+      ;; We could use the #xA1 opcode to save a byte, but that would
+      ;; be another headache do deal with when relocating this code.
+      ;; There's precedent for this style of hand-assembly,
+      ;; in arch_write_linkage_table_entry() and arch_do_displaced_inst().
+      (setf (sap-ref-32 sap 0) #x058B48 ; REX MOV [RIP-n]
+            (signed-sap-ref-32 sap 3) (- ea (+ (sap-int sap) 7))) ; disp
+      (let ((i (if (/= (fun-subtype fun) funcallable-instance-widetag)
+                   7
+                   (let ((disp8 (- (ash funcallable-instance-function-slot
+                                        word-shift)
+                                   fun-pointer-lowtag))) ; = 5
+                     (setf (sap-ref-32 sap 7) (logior (ash disp8 24) #x408B48))
+                     11))))
+        (setf (sap-ref-32 sap i) #xFD60FF))) ; JMP [RAX-3]
+    (aver (zerop (code-n-entries code)))
+    code))
+
+;;; Return T if FUN can't be called without loading RAX with its descriptor.
+;;; This is true of any funcallable instance which is not a GF, and closures.
+(defun fun-requires-simplifying-trampoline-p (fun)
+  (cond ((not (immobile-space-obj-p fun)) t) ; always
+        ((funcallable-instance-p fun)
+         ;; A funcallable-instance with no raw slots has no machine
+         ;; code within it, and thus requires an external trampoline.
+         (eql (layout-bitmap (%funcallable-instance-layout fun))
+              sb!kernel::+layout-all-tagged+))
+        (t
+         (closurep fun))))
+
+(defmacro !set-fin-trampoline (fin)
+  `(let ((sap (int-sap (get-lisp-obj-address ,fin)))
+         (insts-offs (- (ash (1+ funcallable-instance-info-offset) word-shift)
+                        fun-pointer-lowtag)))
+     (setf (sap-ref-word sap insts-offs) #xFFFFFFE9058B48 ; MOV RAX,[RIP-23]
+           (sap-ref-32 sap (+ insts-offs 7)) #x00FD60FF))) ; JMP [RAX-3]
+
+(defun %set-fdefn-fun (fdefn fun)
+  (declare (type fdefn fdefn) (type function fun)
+           (values function))
+  (unless (eql (sb!vm::fdefn-has-static-callers fdefn) 0)
+    (sb!vm::remove-static-links fdefn))
+  (let ((trampoline (when (fun-requires-simplifying-trampoline-p fun)
+                      (fun-immobilize fun)))) ; a newly made CODE object
+    (with-pinned-objects (fdefn trampoline fun)
+      (let* ((jmp-target
+              (if trampoline
+                  ;; Jump right to code-instructions. There's no simple-fun.
+                  (sap-int (code-instructions trampoline))
+                  ;; CLOSURE-CALLEE accesses the self pointer of a funcallable
+                  ;; instance w/ builtin trampoline, or a simple-fun.
+                  ;; But the result is shifted by N-FIXNUM-TAG-BITS because
+                  ;; CELL-REF yields a descriptor-reg, not an unsigned-reg.
+                  (get-lisp-obj-address (%closure-callee fun))))
+             (tagged-ptr-bias
+              ;; compute the difference between the entry address
+              ;; and the tagged pointer to the called object.
+              (the (unsigned-byte 8)
+                   (- jmp-target (get-lisp-obj-address (or trampoline fun)))))
+             (fdefn-addr (- (get-lisp-obj-address fdefn) ; base of the object
+                            other-pointer-lowtag))
+             (jmp-origin ; 5 = instruction length
+              (+ fdefn-addr (ash fdefn-raw-addr-slot word-shift) 5))
+             (jmp-operand
+              (ldb (byte 32 0) (the (signed-byte 32) (- jmp-target jmp-origin)))))
+        (setf (sap-ref-word (int-sap fdefn-addr) (ash fdefn-raw-addr-slot word-shift))
+              (logior #xE9 ; JMP opcode
+                      (ash jmp-operand 8)
+                      (ash #xA890 40) ; "NOP ; TEST %AL, #xNN"
+                      (ash tagged-ptr-bias 56))
+              (sap-ref-lispobj (int-sap fdefn-addr) (ash fdefn-fun-slot word-shift))
+              fun)))))
+) ; end PROGN
+
+;;; Find an immobile FDEFN or FUNCTION given an interior pointer to it.
+#!+immobile-space
+(defun find-called-object (address)
+  ;; The ADDRESS [sic] is actually any immediate operand to MOV,
+  ;; which in general decodes as a *signed* integer. So ignore negative values.
+  (let ((obj (if (typep address 'sb!ext:word)
+                 (alien-funcall (extern-alien "search_all_gc_spaces"
+                                              (function unsigned unsigned))
+                                address)
+                 0)))
+      (unless (eql obj 0)
+        (case (sap-ref-8 (int-sap obj) 0)
+         (#.fdefn-widetag
+          (make-lisp-obj (logior obj other-pointer-lowtag)))
+         (#.funcallable-instance-widetag
+          (make-lisp-obj (logior obj fun-pointer-lowtag)))
+         (#.code-header-widetag
+          (let ((code (make-lisp-obj (logior obj other-pointer-lowtag))))
+            (dotimes (i (code-n-entries code))
+              (let ((f (%code-entry-point code i)))
+                (if (= (+ (get-lisp-obj-address f)
+                          (ash simple-fun-code-offset word-shift)
+                          (- fun-pointer-lowtag))
+                       address)
+                    (return f))))))))))
+
+;;; Compute the PC that FDEFN will jump to when called.
+#!+immobile-code
+(defun fdefn-call-target (fdefn)
+  (let ((pc (+ (get-lisp-obj-address fdefn)
+               (- other-pointer-lowtag)
+               (ash fdefn-raw-addr-slot word-shift))))
+    (+ pc 5 (signed-sap-ref-32 (int-sap pc) 1)))) ; 5 = length of JMP
+
+;;; Undo the effects of XEP-ALLOCATE-FRAME
+;;; and point PC to FUNCTION
+(defun context-call-function (context function &optional arg-count)
+  (with-pinned-objects (function)
+    (let ((rsp (decf (context-register context rsp-offset) n-word-bytes))
+          (rbp (context-register context rbp-offset))
+          (fun-addr (get-lisp-obj-address function)))
+      (setf (sap-ref-word (int-sap rsp) 0)
+            (sap-ref-word (int-sap rbp) 8))
+      (when arg-count
+        (setf (context-register context rcx-offset)
+              (get-lisp-obj-address arg-count)))
+      (setf (context-register context rax-offset) fun-addr)
+      (set-context-pc context (sap-ref-word (int-sap fun-addr)
+                                            (- (ash simple-fun-self-slot word-shift)
+                                               fun-pointer-lowtag))))))

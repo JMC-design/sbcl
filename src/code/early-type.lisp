@@ -19,7 +19,7 @@
       (declare (ignore specifier))
       ;; Technically the instances are not read-only,
       ;; because the hash-value slot is rewritten.
-      `(load-time-value (mark-ctype-interned ,constructor) nil))
+      `(load-time-value ,constructor nil))
 
     (defmacro literal-ctype-vector (var)
       `(load-time-value ,var nil)))
@@ -42,43 +42,20 @@
                              specifier
                              (type-specifier (symbol-value constructor)))))
 
-    (sb!xc:defmacro literal-ctype-vector (var)
-      (let ((vector (symbol-value var)))
-        `(truly-the (simple-vector ,(length vector))
-          (load-time-value
+    (sb!xc:defmacro literal-ctype-vector (var &aux (vector (symbol-value var)))
+      `(truly-the (simple-vector ,(length vector))
+         (load-time-value
            (vector ,@(map 'list
                           (lambda (x)
                             (if (ctype-p x)
                                 `(!specifier-type ',(type-specifier x))
                                 x)) ; allow NIL or 0 in the vector
-                          vector)) t))))))
+                          vector))
+           t)))))
 
 (!begin-collecting-cold-init-forms)
 
 ;;;; representations of types
-
-;;; A HAIRY-TYPE represents anything too weird to be described
-;;; reasonably or to be useful, such as NOT, SATISFIES, unknown types,
-;;; and unreasonably complicated types involving AND. We just remember
-;;; the original type spec.
-;;; A possible improvement would be for HAIRY-TYPE to have a subtype
-;;; named SATISFIES-TYPE for the hairy types which are specifically
-;;; of the form (SATISFIES pred) so that we don't have to examine
-;;; the sexpr repeatedly to decide whether it takes that form.
-;;; And as a further improvement, we might want a table that maps
-;;; predicates to their exactly recognized type when possible.
-;;; We have such a table in fact - *BACKEND-PREDICATE-TYPES*
-;;; as a starting point. But something like PLUSP isn't in there.
-;;; On the other hand, either of these points may not be sources of
-;;; inefficiency, and the latter if implemented might have undesirable
-;;; user-visible ramifications, though it seems unlikely.
-(defstruct (hairy-type (:include ctype
-                                 (class-info (type-class-or-lose 'hairy)))
-                       (:constructor %make-hairy-type (specifier))
-                       (:copier nil)
-                       #!+cmu (:pure nil))
-  ;; the Common Lisp type-specifier of the type we represent
-  (specifier nil :type t :read-only t))
 
 ;; ENUMERABLE-P is T because a hairy type could be equivalent to a MEMBER type.
 ;; e.g. any SATISFIES with a predicate returning T over a finite domain.
@@ -100,9 +77,9 @@
 #+sb-xc-host
 (progn
   (defvar *satisfies-keywordp-type*
-    (mark-ctype-interned (%make-hairy-type '(satisfies keywordp))))
+    (!make-interned-hairy-type '(satisfies keywordp)))
   (defvar *fun-name-type*
-    (mark-ctype-interned (%make-hairy-type '(satisfies legal-fun-name-p)))))
+    (!make-interned-hairy-type '(satisfies legal-fun-name-p))))
 
 ;;; An UNKNOWN-TYPE is a type not known to the type system (not yet
 ;;; defined). We make this distinction since we don't want to complain
@@ -123,7 +100,7 @@
 
 ;;; Evil macro.
 (defmacro maybe-reparse-specifier! (type)
-  (assert (symbolp type))
+  (aver (symbolp type))
   (with-unique-names (new-type)
     `(let ((,new-type (maybe-reparse-specifier ,type)))
        (when ,new-type
@@ -151,7 +128,7 @@
         for i from 0
         for opt in optional
         do (cond ((eq opt *empty-type*)
-                  (return (values required (subseq optional i) rest)))
+                  (return (values required (subseq optional 0 i) rest)))
                  ((and (not keyp) (neq opt rest))
                   (setq last-not-rest i)))
         finally (return (values required
@@ -260,24 +237,30 @@
 #+sb-xc-host
 (defvar *interned-fun-types*
   (flet ((fun-type (n)
-           (mark-ctype-interned
-            (%make-fun-type (make-list n :initial-element *universal-type*)
-                            nil nil nil nil nil nil *wild-type*))))
+           (!make-interned-fun-type (interned-type-hash)
+                                    (make-list n :initial-element *universal-type*)
+                                    nil nil nil nil nil nil *wild-type*)))
     (vector (fun-type 0) (fun-type 1) (fun-type 2) (fun-type 3))))
 
 (defun make-fun-type (&key required optional rest
                            keyp keywords allowp
-                           wild-args returns)
+                           wild-args returns
+                           designator)
   (let ((rest (if (eq rest *empty-type*) nil rest))
         (n (length required)))
-    (if (and (<= n 3)
-             (not optional) (not rest) (not keyp)
-             (not keywords) (not allowp) (not wild-args)
-             (eq returns *wild-type*)
-             (not (find *universal-type* required :test #'neq)))
-        (svref (literal-ctype-vector *interned-fun-types*) n)
-        (%make-fun-type required optional rest keyp keywords
-                        allowp wild-args returns))))
+    (cond (designator
+           (make-fun-designator-type required optional rest keyp keywords
+                                     allowp wild-args returns))
+          ((and
+            (<= n 3)
+            (not optional) (not rest) (not keyp)
+            (not keywords) (not allowp) (not wild-args)
+            (eq returns *wild-type*)
+            (not (find *universal-type* required :test #'neq)))
+           (svref (literal-ctype-vector *interned-fun-types*) n))
+          (t
+           (%make-fun-type required optional rest keyp keywords
+                           allowp wild-args returns)))))
 
 ;; This seems to be used only by cltl2, and within 'cross-type',
 ;; where it is never used, which makes sense, since pretty much we
@@ -302,6 +285,14 @@
 (!define-type-class number :enumerable #'numeric-type-enumerable
                     :might-contain-other-types nil)
 
+(defun interned-numeric-type (specifier &rest args)
+  (apply '%make-numeric-type
+         :hash-value (interned-type-hash
+                      nil nil
+                      (when specifier
+                        (sb!vm::saetp-index-or-lose specifier)))
+         args))
+
 #+sb-xc-host
 (progn
   ;; Work around an ABCL bug. This fails to load:
@@ -309,18 +300,24 @@
   (defvar *interned-signed-byte-types*)
   (defvar *interned-unsigned-byte-types*)
   (macrolet ((int-type (low high)
-               `(mark-ctype-interned
-                 (%make-numeric-type :class 'integer :enumerable t
-                                     :low ,low :high ,high))))
+               `(interned-numeric-type (when (sb!c::find-saetp spec) spec)
+                                       :class 'integer :enumerable t
+                                       :low ,low :high ,high)))
     (setq *interned-signed-byte-types*
-          (let ((v (make-array sb!vm:n-word-bits))
-                (j -1))
-            (dotimes (i sb!vm:n-word-bits v)
-              (setf (svref v i) (int-type j (lognot j)) j (ash j 1)))))
+          (do ((v (make-array sb!vm:n-word-bits))
+               (i 1 (1+ i))
+               (j -1))
+              ((> i sb!vm:n-word-bits) v)
+            (let ((spec (if (= i sb!vm:n-fixnum-bits)
+                            'fixnum
+                            `(signed-byte ,i))))
+              (setf (svref v (1- i)) (int-type j (lognot j))
+                    j (ash j 1)))))
     (setq *interned-unsigned-byte-types*
           (let ((v (make-array (1+ sb!vm:n-word-bits))))
             (dotimes (i (length v) v)
-              (setf (svref v i) (int-type 0 (1- (ash 1 i)))))))))
+              (let ((spec (if (= i 1) 'bit `(unsigned-byte ,i))))
+                (setf (svref v i) (int-type 0 (1- (ash 1 i))))))))))
 
 ;;; Impose canonicalization rules for NUMERIC-TYPE. Note that in some
 ;;; cases, despite the name, we return *EMPTY-TYPE* instead of a
@@ -359,11 +356,13 @@
         ;; a point in the type lattice, or construct a new one.
     (or (case class
           (float
-           (macrolet ((float-type (fmt complexp)
-                        `(literal-ctype
-                          (%make-numeric-type :class 'float :complexp ,complexp
+           (macrolet ((float-type (fmt complexp
+                                   &aux (spec (if (eq complexp :complex)
+                                                  `(complex ,fmt) fmt)))
+                        `(literal-ctype (interned-numeric-type ',spec
+                                              :class 'float :complexp ,complexp
                                               :format ',fmt :enumerable nil)
-                          ,(if (eq complexp :complex) `(complex ,fmt) fmt))))
+                                        ,spec)))
              (when (and (null low) (null high))
                (case format
                  (single-float
@@ -377,9 +376,9 @@
           (integer
            (macrolet ((int-type (low high)
                         `(literal-ctype
-                          (%make-numeric-type
-                           :class 'integer :low ,low :high ,high
-                           :enumerable (if (and ,low ,high) t nil))
+                          (interned-numeric-type nil
+                                              :class 'integer :low ,low :high ,high
+                                              :enumerable (if (and ,low ,high) t nil))
                           (integer ,(or low '*) ,(or high '*)))))
              (cond ((neq complexp :real) nil)
                    ((and (eql low 0) (eql high (1- sb!xc:array-dimension-limit)))
@@ -404,14 +403,10 @@
                     (int-type nil #.(1- sb!xc:most-negative-fixnum))))))
           (rational
            (when (and (eq complexp :real) (null low) (eq high low))
-             (literal-ctype (%make-numeric-type :class 'rational) rational))))
-        (let ((result (%make-numeric-type :class class :format format
-                                          :complexp complexp
-                                          :low low :high high
-                                          :enumerable enumerable)))
-          (setf (type-hash-value result)
-                (logior (type-hash-value result) +type-admits-type=-optimization+))
-          result))))
+             (literal-ctype (interned-numeric-type nil :class 'rational)
+                            rational))))
+        (%make-numeric-type :class class :format format :complexp complexp
+                            :low low :high high :enumerable enumerable))))
 
 (defun modified-numeric-type (base
                               &key
@@ -454,22 +449,27 @@
     (unless pairs
       (return-from make-character-set-type *empty-type*))
     (unless (cdr pairs)
-      (macrolet ((range (low high)
+      (macrolet ((range (low high &optional saetp-index)
                    `(return-from make-character-set-type
-                      (literal-ctype (%make-character-set-type '((,low . ,high)))
+                      (literal-ctype (!make-interned-character-set-type
+                                      (interned-type-hash nil nil ,saetp-index)
+                                      '((,low . ,high)))
                                      (character-set ((,low . ,high)))))))
         (let* ((pair (car pairs))
                (low (car pair))
                (high (cdr pair)))
           (cond ((eql high (1- sb!xc:char-code-limit))
-                 (cond ((eql low 0) (range 0 #.(1- sb!xc:char-code-limit)))
+                 (cond ((eql low 0)
+                        (range 0 #.(1- sb!xc:char-code-limit)
+                               (sb!vm::saetp-index-or-lose 'character)))
                        #!+sb-unicode
                        ((eql low base-char-code-limit)
                         (range #.base-char-code-limit
                                #.(1- sb!xc:char-code-limit)))))
                 #!+sb-unicode
                 ((and (eql low 0) (eql high (1- base-char-code-limit)))
-                 (range 0 #.(1- base-char-code-limit)))))))
+                 (range 0 #.(1- base-char-code-limit)
+                        (sb!vm::saetp-index-or-lose 'base-char)))))))
     (%make-character-set-type pairs)))
 
 (!define-type-class array :enumerable nil
@@ -484,8 +484,9 @@
 (progn
 (defvar *interned-array-types*
   (labels ((make-1 (type-index dims complexp type)
-             (setf (!ctype-saetp-index type) type-index)
-             (mark-ctype-interned (%make-array-type dims complexp type type)))
+             (aver (= (!ctype-saetp-index type) type-index))
+             (!make-interned-array-type (interned-type-hash nil 'array)
+                                        dims complexp type type))
            (make-all (element-type type-index array)
              (replace array
                       (list (make-1 type-index '(*) nil    element-type)
@@ -602,7 +603,9 @@
              (unless unpaired
                (macrolet ((member-type (&rest elts)
                             `(literal-ctype
-                              (%make-member-type (xset-from-list ',elts) nil)
+                              (!make-interned-member-type (interned-type-hash)
+                                                          (xset-from-list ',elts)
+                                                          nil)
                               (member ,@elts))))
                  (let ((elts (xset-data xset)))
                    (when (singleton-p elts)
@@ -615,11 +618,7 @@
                      ;; (when not represented as a hash-table).
                      (return (member-type t nil))))))
              (when (or unpaired (not (xset-empty-p xset)))
-               (let ((result (%make-member-type xset unpaired)))
-                 (setf (type-hash-value result)
-                       (logior (type-hash-value result)
-                               +type-admits-type=-optimization+))
-                 result)))))
+               (%make-member-type xset unpaired)))))
       ;; The actual member-type contains the XSET (with no FP zeroes),
       ;; and a list of unpaired zeroes.
       (if float-types
@@ -680,7 +679,9 @@
         ;; but it improves the hit rate in the function caches.
         ((and (type= car-type *universal-type*)
               (type= cdr-type *universal-type*))
-         (literal-ctype (%make-cons-type *universal-type* *universal-type*)
+         (literal-ctype (!make-interned-cons-type (interned-type-hash)
+                                                  *universal-type*
+                                                  *universal-type*)
                         cons))
         (t
          (%make-cons-type car-type cdr-type))))
@@ -892,7 +893,6 @@
       (specifier-type x)))
 
 (defun typexpand-1 (type-specifier &optional env)
-  #!+sb-doc
   "Takes and expands a type specifier once like MACROEXPAND-1.
 Returns two values: the expansion, and a boolean that is true when
 expansion happened."
@@ -913,7 +913,6 @@ expansion happened."
         (values type-specifier nil))))
 
 (defun typexpand (type-specifier &optional env)
-  #!+sb-doc
   "Takes and expands a type specifier repeatedly like MACROEXPAND.
 Returns two values: the expansion, and a boolean that is true when
 expansion happened."

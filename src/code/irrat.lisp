@@ -18,34 +18,35 @@
   #!+long-float 3.14159265358979323846264338327950288419716939937511l0
   #!-long-float 3.14159265358979323846264338327950288419716939937511d0)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun handle-reals (function var)
+    `((((foreach fixnum single-float bignum ratio))
+       (coerce (,function (coerce ,var 'double-float)) 'single-float))
+      ((double-float)
+       (,function ,var))))
+
+  (defun handle-complex (form)
+    `((((foreach (complex double-float) (complex single-float) (complex rational)))
+       ,form))))
+
 ;;; Make these INLINE, since the call to C is at least as compact as a
 ;;; Lisp call, and saves number consing to boot.
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro def-math-rtn (name num-args &optional wrapper)
+(defmacro def-math-rtn (name num-args &optional wrapper)
   (let ((function (symbolicate "%" (string-upcase name)))
         (args (loop for i below num-args
                     collect (intern (format nil "ARG~D" i)))))
     `(progn
        (declaim (inline ,function))
        (defun ,function ,args
-         (alien-funcall
-          (extern-alien ,(format nil "~:[~;sb_~]~a" wrapper name)
-                        (function double-float
-                                  ,@(loop repeat num-args
-                                          collect 'double-float)))
-          ,@args)))))
+         (truly-the ;; avoid checking the result
+          ,(type-specifier (fun-type-returns (info :function :type function)))
+          (alien-funcall
+           (extern-alien ,(format nil "~:[~;sb_~]~a" wrapper name)
+                         (function double-float
+                                   ,@(loop repeat num-args
+                                           collect 'double-float)))
+           ,@args))))))
 
-(defun handle-reals (function var)
-  `((((foreach fixnum single-float bignum ratio))
-     (coerce (,function (coerce ,var 'double-float)) 'single-float))
-    ((double-float)
-     (,function ,var))))
-
-(defun handle-complex (form)
-  `((((foreach (complex double-float) (complex single-float) (complex rational)))
-     ,form)))
-) ; EVAL-WHEN
 
 #!+x86 ;; for constant folding
 (macrolet ((def (name ll)
@@ -101,7 +102,6 @@
 ;;;; power functions
 
 (defun exp (number)
-  #!+sb-doc
   "Return e raised to the power NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -156,7 +156,6 @@
 ;;; result. We also separate the complex-real and real-complex cases
 ;;; from the general complex case.
 (defun expt (base power)
-  #!+sb-doc
   "Return BASE raised to the POWER."
   (declare (explicit-check))
   (if (zerop power)
@@ -164,7 +163,7 @@
         (error 'arguments-out-of-domain-error
                :operands (list base power)
                :operation 'expt
-               :references (list '(:ansi-cl :function expt)))
+               :references '((:ansi-cl :function expt)))
         (let ((result (1+ (* base power))))
           (if (and (floatp result) (float-nan-p result))
               (float 1 result)
@@ -359,7 +358,6 @@
                     2.0d0))))))
 
 (defun log (number &optional (base nil base-p))
-  #!+sb-doc
   "Return the logarithm of NUMBER in the base BASE, which defaults to e."
   (declare (explicit-check))
   (if base-p
@@ -408,7 +406,6 @@
          (complex-log number)))))
 
 (defun sqrt (number)
-  #!+sb-doc
   "Return the square root of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -430,7 +427,6 @@
 ;;;; trigonometic and related functions
 
 (defun abs (number)
-  #!+sb-doc
   "Return the absolute value of the number."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -450,7 +446,6 @@
           (%hypot rx (truly-the double-float ix))))))))
 
 (defun phase (number)
-  #!+sb-doc
   "Return the angle part of the polar representation of a complex number.
   For complex numbers, this is (atan (imagpart number) (realpart number)).
   For non-complex positive numbers, this is 0. For non-complex negative
@@ -473,7 +468,6 @@
      (atan (imagpart number) (realpart number)))))
 
 (defun sin (number)
-  #!+sb-doc
   "Return the sine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -485,7 +479,6 @@
                 (* (cos x) (sinh y)))))))
 
 (defun cos (number)
-  #!+sb-doc
   "Return the cosine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -497,7 +490,6 @@
                 (- (* (sin x) (sinh y))))))))
 
 (defun tan (number)
-  #!+sb-doc
   "Return the tangent of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -510,7 +502,6 @@
                 (- (realpart result)))))))
 
 (defun cis (theta)
-  #!+sb-doc
   "Return cos(Theta) + i sin(Theta), i.e. exp(i Theta)."
   (declare (explicit-check ))
   (number-dispatch ((theta real))
@@ -518,7 +509,6 @@
      (complex (cos theta) (sin theta)))))
 
 (defun asin (number)
-  #!+sb-doc
   "Return the arc sine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -536,7 +526,6 @@
      (complex-asin number))))
 
 (defun acos (number)
-  #!+sb-doc
   "Return the arc cosine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -554,7 +543,6 @@
      (complex-acos number))))
 
 (defun atan (y &optional (x nil xp))
-  #!+sb-doc
   "Return the arc tangent of Y if X is omitted or Y/X if X is supplied."
   (declare (explicit-check))
   (if xp
@@ -591,7 +579,6 @@
 ;;; complex numbers can also lose big.
 
 (defun sinh (number)
-  #!+sb-doc
   "Return the hyperbolic sine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -603,7 +590,6 @@
                 (* (cosh x) (sin y)))))))
 
 (defun cosh (number)
-  #!+sb-doc
   "Return the hyperbolic cosine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -615,7 +601,6 @@
                 (* (sinh x) (sin y)))))))
 
 (defun tanh (number)
-  #!+sb-doc
   "Return the hyperbolic tangent of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -624,7 +609,6 @@
      (complex-tanh number))))
 
 (defun asinh (number)
-  #!+sb-doc
   "Return the hyperbolic arc sine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -633,7 +617,6 @@
      (complex-asinh number))))
 
 (defun acosh (number)
-  #!+sb-doc
   "Return the hyperbolic arc cosine of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -651,7 +634,6 @@
      (complex-acosh number))))
 
 (defun atanh (number)
-  #!+sb-doc
   "Return the hyperbolic arc tangent of NUMBER."
   (declare (explicit-check))
   (number-dispatch ((number number))
@@ -815,7 +797,7 @@
 #!+long-float (eval-when (:compile-toplevel :load-toplevel :execute)
                 (error "needs work for long float support"))
 (defun cssqs (z)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (let ((x (float (realpart z) 1d0))
         (y (float (imagpart z) 1d0)))
     ;; Would this be better handled using an exception handler to
@@ -840,7 +822,7 @@
                      (make-double-float #x1fffff #xfffffffe)
                      #!+long-float
                      (error "(/ least-positive-long-float long-float-epsilon)")))
-                   (traps (ldb sb!vm::float-sticky-bits
+                   (traps (ldb sb!vm:float-sticky-bits
                                (sb!vm:floating-point-modes))))
                 ;; Overflow raised or (underflow raised and rho <
                 ;; lambda/eps)
@@ -906,7 +888,7 @@
 ;;;
 ;;; Z may be any number, but the result is always a complex.
 (defun complex-log (z)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (declare (type (or rational complex) z))
   ;; The constants t0, t1, t2 should be evaluated to machine
   ;; precision.  In addition, Kahan says the accuracy of log1p
@@ -955,7 +937,7 @@
 ;;; i*y is never 0 since we have positive and negative zeroes. -- rtoy
 ;;; Compute atanh z = (log(1+z) - log(1-z))/2.
 (defun complex-atanh (z)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (declare (type (or rational complex) z))
   (let* (;; constants
          (theta (/ (sqrt most-positive-double-float) 4.0d0))
@@ -1013,7 +995,7 @@
 
 ;;; Compute tanh z = sinh z / cosh z.
 (defun complex-tanh (z)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (declare (type (or rational complex) z))
   (let ((x (float (realpart z) 1.0d0))
         (y (float (imagpart z) 1.0d0)))

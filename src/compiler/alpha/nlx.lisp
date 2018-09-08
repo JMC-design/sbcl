@@ -63,6 +63,16 @@
   (:results (res :scs (any-reg descriptor-reg)))
   (:generator 1
     (move bsp-tn res)))
+
+(define-vop (current-nsp)
+  (:results (res :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move res nsp-tn)))
+
+(define-vop (set-nsp)
+  (:args (nsp :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move nsp-tn nsp)))
 
 ;;;; unwind block hackery
 
@@ -110,14 +120,12 @@
 
     (move result block)))
 
-;;; Just set the current unwind-protect to TN's address. This
+;;; Just set the current unwind-protect to UWP. This
 ;;; instantiates an unwind block as an unwind-protect.
 (define-vop (set-unwind-protect)
-  (:args (tn))
-  (:temporary (:scs (descriptor-reg)) new-uwp)
+  (:args (uwp :scs (any-reg)))
   (:generator 7
-    (inst lda new-uwp (* (tn-offset tn) n-word-bytes) cfp-tn)
-    (store-symbol-value new-uwp *current-unwind-protect-block*)))
+    (store-symbol-value uwp *current-unwind-protect-block*)))
 
 (define-vop (unlink-catch-block)
   (:temporary (:scs (any-reg)) block)
@@ -183,7 +191,7 @@
 
                (emit-label defaulting-done)
 
-               (assemble (*elsewhere*)
+               (assemble (:elsewhere)
                  (dolist (def (defaults))
                    (emit-label (car def))
                    (let ((tn (cdr def)))

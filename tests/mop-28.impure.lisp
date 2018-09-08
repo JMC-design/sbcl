@@ -16,8 +16,6 @@
 ;;; strategy implicit in the second return value of
 ;;; compute-applicable-methods-using-classes.
 
-(load "assertoid.lisp")
-
 (defpackage "OR-SPECIALIZER-TEST"
   (:use "CL" "SB-MOP" "ASSERTOID"))
 
@@ -39,6 +37,12 @@
 
 (defclass gf-with-or (standard-generic-function) ()
   (:metaclass funcallable-standard-class))
+
+(defmethod sb-pcl:specializer-type-specifier
+    ((proto-generic-function gf-with-or)
+     (proto-method t)
+     (specializer or-specializer))
+  `(or ,@(or-specializer-classes specializer)))
 
 (defmethod compute-applicable-methods-using-classes
     ((generic-function gf-with-or) classes)

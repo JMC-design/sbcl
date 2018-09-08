@@ -13,20 +13,21 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; SAVE-LISP-AND-DIE itself
 
+#-gencgc
 (define-alien-routine "save" (boolean)
   (file c-string)
-  (initial-fun (unsigned #.sb!vm:n-word-bits))
+  (initial-fun (unsigned #.sb-vm:n-word-bits))
   (prepend-runtime int)
   (save-runtime-options int)
   (compressed int)
   (compression-level int)
   (application-type int))
 
-#!+gencgc
+#+gencgc
 (define-alien-routine "gc_and_save" void
   (file c-string)
   (prepend-runtime int)
@@ -35,13 +36,13 @@
   (compression-level int)
   (application-type int))
 
-#!+gencgc
-(defvar sb!vm::*restart-lisp-function*)
+#+gencgc
+(define-alien-variable "lisp_init_function" (unsigned #.sb-vm:n-machine-word-bits))
 
 (define-condition save-condition (reference-condition)
   ()
   (:default-initargs
-   :references (list '(:sbcl :node "Saving a Core Image"))))
+   :references '((:sbcl :node "Saving a Core Image"))))
 
 (define-condition save-error (error save-condition)
   ()
@@ -71,9 +72,8 @@
                                          (root-structures ())
                                          (environment-name "auxiliary")
                                          (compression nil)
-                                         #!+win32
+                                         #+win32
                                          (application-type :console))
-  #!+sb-doc
   "Save a \"core image\", i.e. enough information to restart a Lisp
 process later in the same state, in the file of the specified name.
 Only global state is preserved: the stack is unwound in the process.
@@ -170,87 +170,145 @@ This isn't because we like it this way, but just because there don't
 seem to be good quick fixes for either limitation and no one has been
 sufficiently motivated to do lengthy fixes."
   (declare (ignore environment-name))
-  #!+gencgc
+  #+gencgc
   (declare (ignore purify) (ignorable root-structures))
-  #!+sb-core-compression
-  (check-type compression (or boolean (integer -1 9)))
-  #!-sb-core-compression
-  (when compression
-    (error "Unable to save compressed core: this runtime was not built with zlib support"))
-  (when *dribble-stream*
-    (restart-case (error "Dribbling to ~s is enabled." (pathname *dribble-stream*))
-      (continue ()
-        :report "Stop dribbling and save the core."
-        (dribble))
-      (abort ()
-        :report "Abort saving the core."
-        (return-from save-lisp-and-die))))
-  (when (eql t compression)
-    (setf compression -1))
-  (labels ((restart-lisp ()
-             (handling-end-of-the-world
-              (reinit)
-              #!+hpux (%primitive sb!vm::setup-return-from-lisp-stub)
-              (funcall toplevel)))
-           (foreign-bool (value)
-             (if value 1 0)))
-    (let ((name (native-namestring (physicalize-pathname core-file-name)
-                                   :as-file t)))
-      (tune-image-for-dump)
-      (deinit)
-  ;; FIXME: Would it be possible to unmix the PURIFY logic from this
-  ;; function, and just do a GC :FULL T here? (Then if the user wanted
-  ;; a PURIFYed image, he'd just run PURIFY immediately before calling
-  ;; SAVE-LISP-AND-DIE.)
-    #!+gencgc
-    (progn
-      ;; Scan roots as close as possible to GC-AND-SAVE, in case anything
-      ;; prior causes compilation to occur into immobile space.
-      ;; Failing to see all immobile code would miss some relocs.
-      #!+immobile-code (sb!kernel::choose-code-component-order root-structures)
-      ;; Save the restart function into a static symbol, to allow GC-AND-SAVE
-      ;; access to it even after the GC has moved it.
-      (setf sb!vm::*restart-lisp-function* #'restart-lisp)
-      ;; Do a destructive non-conservative GC, and then save a core.
-      ;; A normal GC will leave huge amounts of storage unreclaimed
-      ;; (over 50% on x86). This needs to be done by a single function
-      ;; since the GC will invalidate the stack.
-      (gc-and-save name
-                   (foreign-bool executable)
-                   (foreign-bool save-runtime-options)
-                   (foreign-bool compression)
-                   (or compression 0)
-                   #!+win32 (ecase application-type (:console 0) (:gui 1))
-                   #!-win32 0))
-    #!-gencgc
-    (progn
-      (if purify (purify :root-structures root-structures) (gc))
-      (without-gcing
-       (save name
-             (get-lisp-obj-address #'restart-lisp)
-             (foreign-bool executable)
-             (foreign-bool save-runtime-options)
-             (foreign-bool compression)
-             (or compression 0)
-             #!+win32 (ecase application-type (:console 0) (:gui 1))
-             #!-win32 0)))))
+  ;; If the toplevel function is not defined, this will signal an
+  ;; error before saving, not at startup time.
+  (let ((toplevel (%coerce-callable-to-fun toplevel)))
+    #+sb-core-compression
+    (check-type compression (or boolean (integer -1 9)))
+    #-sb-core-compression
+    (when compression
+      (error "Unable to save compressed core: this runtime was not built with zlib support"))
+    (when *dribble-stream*
+      (restart-case (error "Dribbling to ~s is enabled." (pathname *dribble-stream*))
+        (continue ()
+          :report "Stop dribbling and save the core."
+          (dribble))
+        (abort ()
+          :report "Abort saving the core."
+          (return-from save-lisp-and-die))))
+    (when (eql t compression)
+      (setf compression -1))
+
+    ;; C code will GC again (nonconservatively if pertinent), but the coalescing
+    ;; steps done below will be more efficient if some junk is removed now.
+    #+gencgc (gc :full t)
+
+    ;; Share EQUALP FUN-INFOs
+    (let ((ht (make-hash-table :test 'equalp)))
+      (sb-int:call-with-each-globaldb-name
+       (lambda (name)
+         (binding* ((info (info :function :info name) :exit-if-null)
+                    (shared-info (gethash info ht)))
+           (if shared-info
+               (setf (info :function :info name) shared-info)
+               (setf (gethash info ht) info))))))
+    ;; Share similar simple-fun arglists and types
+    ;; EQUALISH considers any two identically-spelled gensyms as EQ
+    (let ((arglist-hash (make-hash-table :hash-function 'equal-hash
+                                         :test 'fun-names-equalish))
+          (type-hash (make-hash-table :test 'equal)))
+      (sb-vm:map-allocated-objects
+       (lambda (object widetag size)
+         (declare (ignore size))
+         (when (= widetag sb-vm:code-header-widetag)
+           (dotimes (i (sb-kernel:code-n-entries object))
+             (let* ((fun (sb-kernel:%code-entry-point object i))
+                    (arglist (%simple-fun-arglist fun))
+                    (type (sb-vm::%%simple-fun-type fun)))
+               (setf (%simple-fun-arglist fun)
+                     (ensure-gethash arglist arglist-hash arglist))
+               (setf (sb-kernel:%simple-fun-type fun)
+                     (ensure-gethash type type-hash type))))))
+       :all))
+    (sb-c::coalesce-debug-sources)
+    ;;
+    (labels ((restart-lisp ()
+               (handling-end-of-the-world
+                 (reinit)
+                 ;; REINIT can not discern between a restarted image and a
+                 ;; failure to save. It doesn't make a lot of sense to start
+                 ;; a finalizer thread in the failed case, so we set the flag
+                 ;; here, not in REINIT which would do it for both cases.
+                 #+sb-thread (setq *finalizer-thread* t)
+                 #+hpux (%primitive sb-vm::setup-return-from-lisp-stub)
+                 (funcall toplevel)))
+             (foreign-bool (value)
+               (if value 1 0)))
+      (let ((name (native-namestring (physicalize-pathname core-file-name)
+                                     :as-file t)))
+        (tune-image-for-dump)
+        (deinit)
+        ;; FIXME: Would it be possible to unmix the PURIFY logic from this
+        ;; function, and just do a GC :FULL T here? (Then if the user wanted
+        ;; a PURIFYed image, he'd just run PURIFY immediately before calling
+        ;; SAVE-LISP-AND-DIE.)
+        #+gencgc
+        (progn
+          #+immobile-code
+          (progn
+            ;; Perform static linkage. There seems to be no reason to have users
+            ;; decide whether they want this. Functions become un-statically-linked
+            ;; on demand, for TRACE, redefinition, etc.
+            (sb-vm::statically-link-core)
+            ;; Scan roots as close as possible to GC-AND-SAVE, in case anything
+            ;; prior causes compilation to occur into immobile space.
+            ;; Failing to see all immobile code would miss some relocs.
+            (sb-vm::choose-code-component-order root-structures))
+          ;; Save the restart function. Logically a passed argument, but can't be,
+          ;; as it would require pinning around the whole save operation.
+          (with-pinned-objects (#'restart-lisp)
+            (setf lisp-init-function (get-lisp-obj-address #'restart-lisp)))
+          ;; Do a destructive non-conservative GC, and then save a core.
+          ;; A normal GC will leave huge amounts of storage unreclaimed
+          ;; (over 50% on x86). This needs to be done by a single function
+          ;; since the GC will invalidate the stack.
+          (gc-and-save name
+                       (foreign-bool executable)
+                       (foreign-bool save-runtime-options)
+                       (foreign-bool compression)
+                       (or compression 0)
+                       #+win32 (ecase application-type (:console 0) (:gui 1))
+                       #-win32 0)
+          (setf lisp-init-function 0)) ; only reach here on save error
+        #-gencgc
+        (progn
+          ;; Coalescing after GC will do no good - the un-needed dups
+          ;; of things won't actually go away. Do it before.
+          (alien-funcall (extern-alien "coalesce_similar_objects"
+                                       (function void)))
+          (if purify (purify :root-structures root-structures) (gc))
+          (without-gcing
+            (save name
+                  (get-lisp-obj-address #'restart-lisp)
+                  (foreign-bool executable)
+                  (foreign-bool save-runtime-options)
+                  (foreign-bool compression)
+                  (or compression 0)
+                  #+win32 (ecase application-type (:console 0) (:gui 1))
+                  #-win32 0)))))
 
     ;; Something went very wrong -- reinitialize to have a prayer
     ;; of being able to report the error.
-  (reinit)
-  (error 'save-error))
+    (reinit)
+    (error 'save-error)))
 
 (defun tune-image-for-dump ()
-  #!+sb-fasteval (sb!interpreter::flush-everything)
+  #+sb-fasteval (sb-interpreter::flush-everything)
   (tune-hashtable-sizes-of-all-packages))
 
 (defun deinit ()
   (call-hooks "save" *save-hooks*)
-  #!+sb-wtimer
+  #+sb-wtimer
   (itimer-emulation-deinit)
-  (let ((threads (sb!thread:list-all-threads)))
+  ;; Terminate finalizer thread now, especially given that the thread runs
+  ;; user-supplied code that might not even work in later steps of deinit.
+  ;; See also the comment at definition of THREAD-EPHEMERAL-P.
+  #+sb-thread (finalizer-thread-stop)
+  (let ((threads (sb-thread:list-all-threads)))
     (unless (= 1 (length threads))
-      (let* ((interactive (sb!thread::interactive-threads))
+      (let* ((interactive (sb-thread::interactive-threads))
              (other (set-difference threads interactive)))
         (error 'save-with-multiple-threads-error
                :interactive-threads interactive
@@ -258,10 +316,151 @@ sufficiently motivated to do lengthy fixes."
   (float-deinit)
   (profile-deinit)
   (foreign-deinit)
-  (stream-deinit)
-  (deinit-finalizers)
+  (finalizers-deinit)
+  (fill *pathnames* nil)
+  ;; Clean up the simulated weak list of covered code components.
+  (rplacd sb-c:*code-coverage-info*
+          (delete-if-not #'weak-pointer-value (cdr sb-c:*code-coverage-info*)))
+  ;; Clearing the hash caches must be done after coalescing ctype instances
+  ;; because coalescing compares by TYPE= which creates more cache entries.
+  (coalesce-ctypes)
   (drop-all-hash-caches)
+  ;; Must clear this cache if asm routines are movable.
+  (setq sb-disassem::*assembler-routines-by-addr* nil)
   (os-deinit)
+  ;; Do this last, to have some hope of printing if we need to.
+  (stream-deinit)
   (setf * nil ** nil *** nil
         - nil + nil ++ nil +++ nil
         /// nil // nil / nil))
+
+;;; Try to produce a unique representative of each ctype in memory as
+;;; compared by TYPE=, redirecting references on to the chosen representative.
+;;; In the base SBCL image this removes about 400 ctypes instances.
+;;; When saving a large application it can (and does) remove thousands more.
+;;; This is actually not about space saving, but reducing non-determinism.
+;;; Because of the random nature of the type caches (using opaque hashes that
+;;; are generated based on memory address) it's totally arbitrary when we create
+;;; new instances of ctypes. Coalescing tries to make it less so.  As to
+;;; reproducibility, the fact that type-hash-value is an unintelligent key
+;;; is a big problem. I can't think of how to easily make it intelligent,
+;;; but it might work to zero them all out, and restore the hash on demand
+;;; (much the way symbol-hash is lazily computed) which ought to be fine
+;;; since all hash caches start out empty.
+;;; Doing too much consing within MAP-ALLOCATED-OBJECTS can lead to heap
+;;; exhaustion (due to inhibited GC), so this takes several passes.
+(defun coalesce-ctypes (&optional verbose)
+  (let* ((dynspace-start (current-dynamic-space-start))
+         (dynspace-end (+ dynspace-start (dynamic-space-size)))
+         (table (make-hash-table :test 'equal))
+         interned-ctypes
+         referencing-objects)
+    (labels ((in-dynamic-space-p (obj)
+               (let ((a (get-lisp-obj-address obj)))
+                 (and (sb-vm:is-lisp-pointer a)
+                      (>= a dynspace-start)
+                      (< a dynspace-end))))
+             (interesting-subpart-p (part)
+               ;; Heap objects can point to "dead" stack objects - those
+               ;; from a no-longer-existing stack frame - so only examine
+               ;; outgoing references within the dynamic space.
+               ;; As to why the pointing object didn't die - who knows?
+               (and (in-dynamic-space-p part)
+                    (typep part 'ctype)
+                    ;; PART is not interesting if it points to an interned
+                    ;; ctype, because that's already a canonical object.
+                    (not (minusp (type-hash-value part)))))
+             (coalesce (type &aux (spec (type-specifier type)))
+               (dolist (choice (gethash spec table)
+                               (progn (push type (gethash spec table)) type))
+                 (when (type= choice type)
+                   (return choice)))))
+      ;; Start by collecting interned types, as well as any object that points
+      ;; to a ctype.
+      ;; Interned ctypes (mostly classoids, but a few others) have the aspect
+      ;; that if two specifiers are equal, then they map to the same internal
+      ;; object. This does not discount the possibility that some other ctype
+      ;; could be EQ to that type, as occurs with array upgrading.
+      (sb-vm:map-allocated-objects
+       (lambda (obj type size)
+         (declare (ignore type size))
+         (when (and (typep obj 'ctype) (minusp (type-hash-value obj)))
+           (push obj interned-ctypes))
+         (macrolet ((examine (form)
+                      ;; when the subpart of OBJ is possibly going
+                      ;; to get coalesced, then record OBJ.
+                      `(when (interesting-subpart-p ,form)
+                         (push obj referencing-objects)
+                         (return-from skip))))
+           ;; Wrap a block named other than NIL since
+           ;; DO-REFERENCED-OBJECTS has several named NIL.
+           (block skip (sb-vm:do-referenced-object (obj examine)))))
+       :all)
+      (when verbose
+        (format t "Found ~d interned types, ~d referencing objects~%"
+                (length interned-ctypes) (length referencing-objects)))
+      (dolist (type interned-ctypes)
+        (setf (gethash (type-specifier type) table) (list type)))
+      (dolist (obj referencing-objects)
+        (let (written)
+          (macrolet ((examine (form &aux (accessor (if (listp form) (car form))))
+                       (cond
+                         ((not (listp form))
+                          ;; do-closure-values passes an access form that
+                          ;; can't be inverted to a writing form
+                          `(progn ,form nil))
+                         ((eq accessor 'data-vector-ref)
+                          `(let ((part ,form))
+                             (when (interesting-subpart-p part)
+                               (let ((new (coalesce part)))
+                                 (unless (eq new part)
+                                   (setf (svref obj ,(caddr form)) new
+                                         written t))))))
+                         ((and (eq accessor '%primitive)
+                               (eq (cadr form) 'sb-c:fast-symbol-global-value))
+                          `(let ((part ,form))
+                             (when (interesting-subpart-p part)
+                               ;; just do it - skip the attempt-to-modify check
+                               (%set-symbol-global-value obj (coalesce part)))))
+                         ((not (memq accessor
+                                     '(%closure-fun
+                                       symbol-package symbol-name fdefn-name
+                                       %numerator %denominator
+                                       %realpart %imagpart
+                                       %make-lisp-obj ; fdefn referent
+                                       ;; hope no weak pointers point at ctypes
+                                       weak-pointer-value)))
+                          `(let ((part ,form))
+                             (when (interesting-subpart-p part)
+                               (setf ,form (coalesce part))))))))
+            (sb-vm:do-referenced-object (obj examine)
+              (simple-vector
+               :extend
+               (when (and written (eql sb-vm:vector-valid-hashing-subtype
+                                       (get-header-data obj)))
+                 (setf (svref obj 1) 1)))))))))) ; set need-to-rehash
+
+sb-c::
+(defun coalesce-debug-sources ()
+  (flet ((debug-source= (a b)
+           (and (equal (debug-source-plist a) (debug-source-plist b))
+                (eql (debug-source-created a) (debug-source-created b))
+                (eql (debug-source-compiled a) (debug-source-compiled b)))))
+    (let ((ht (make-hash-table :test 'equal)))
+      (sb-vm:map-allocated-objects
+       (lambda (obj type size)
+         (declare (ignore type size))
+         (when (typep obj 'compiled-debug-info)
+           (let ((source (compiled-debug-info-source obj)))
+             (typecase source
+               (core-debug-source) ; skip
+               (debug-source
+                (let ((canonical-repr
+                       (find-if (lambda (x) (debug-source= x source))
+                                (gethash (debug-source-namestring source) ht))))
+                  (cond ((not canonical-repr)
+                         (push source (gethash (debug-source-namestring source) ht)))
+                        ((neq source canonical-repr)
+                         (setf (compiled-debug-info-source obj)
+                               canonical-repr)))))))))
+       :all))))

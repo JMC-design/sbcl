@@ -56,7 +56,7 @@
   (let ((code (fun-code-header (%fun-fun fun))))
     (loop for i from sb-vm:code-constants-offset below (code-header-words code)
           for c = (code-header-ref code i)
-          for value = (if (= (widetag-of c) sb-vm:value-cell-header-widetag)
+          for value = (if (= (widetag-of c) sb-vm:value-cell-widetag)
                           (value-cell-ref c)
                           c)
           when (typep value type)
@@ -65,6 +65,9 @@
 (defun collect-consing-stats (thunk times)
   (declare (type function thunk))
   (declare (type fixnum times))
+  #+(and sb-thread gencgc)
+  (sb-vm::close-current-gc-region)
+  (setf sb-int:*n-bytes-freed-or-purified* 0)
   (let ((before (sb-ext:get-bytes-consed)))
     (dotimes (i times)
       (funcall thunk))
@@ -100,7 +103,8 @@
 
 (defun file-compile (toplevel-forms &key load)
   (let* ((lisp (merge-pathnames "file-compile-tmp.lisp"))
-         (fasl (compile-file-pathname lisp)))
+         (fasl (compile-file-pathname lisp))
+         (error-stream (make-string-output-stream)))
     (unwind-protect
          (progn
            (with-open-file (f lisp :direction :output)
@@ -108,10 +112,13 @@
                  (write-line toplevel-forms f)
                  (dolist (form toplevel-forms)
                    (prin1 form f))))
-           (multiple-value-bind (fasl warn fail) (compile-file lisp)
+           (multiple-value-bind (fasl warn fail)
+               (let ((*error-output* error-stream))
+                 (compile-file lisp :print nil :verbose nil))
              (when load
-               (load fasl))
-             (values warn fail)))
+               (let ((*error-output* error-stream))
+                 (load fasl :print nil :verbose nil)))
+             (values warn fail error-stream)))
       (ignore-errors (delete-file lisp))
       (ignore-errors (delete-file fasl)))))
 

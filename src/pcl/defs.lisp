@@ -100,7 +100,6 @@
          (error "~S is neither a type nor a specializer." specl))))
 
 (defun type-class (type)
-  (declare (special *the-class-t*))
   (setq type (type-from-specializer type))
   (if (atom type)
       (if (eq type t)
@@ -180,8 +179,7 @@
                (subtypep (convert-to-system-type type1)
                          (convert-to-system-type type2))))))))
 
-(defvar *built-in-class-symbols* ())
-(defvar *built-in-wrapper-symbols* ())
+(define-load-time-global *built-in-class-symbols* ())
 
 (defun get-built-in-class-symbol (class-name)
   (or (cadr (assq class-name *built-in-class-symbols*))
@@ -207,7 +205,7 @@
 ;;; Grovel over SB-KERNEL::*!BUILT-IN-CLASSES* in order to set
 ;;; SB-PCL:*BUILT-IN-CLASSES*.
 (/show "about to set up SB-PCL::*BUILT-IN-CLASSES*")
-(defvar *built-in-classes*
+(define-load-time-global *built-in-classes*
   (labels ((direct-supers (class)
              (/noshow "entering DIRECT-SUPERS" (classoid-name class))
              (if (typep class 'built-in-classoid)
@@ -293,10 +291,6 @@
 
 (defclass structure-object (slot-object) ()
   (:metaclass structure-class))
-
-(defstruct (dead-beef-structure-object
-            (:constructor |STRUCTURE-OBJECT class constructor|)
-            (:copier nil)))
 
 (defclass standard-object (slot-object) ())
 
@@ -405,30 +399,21 @@
 
 (defclass standard-method-combination (definition-source-mixin
                                        method-combination)
-  ((type-name
-    :reader method-combination-type-name
-    :initarg :type-name)
-   (options
-    :reader method-combination-options
-    :initarg :options)))
+  ((type-name :reader method-combination-type-name :initarg :type-name)
+   (options :reader method-combination-options :initarg :options)
+   (%generic-functions :initform (make-hash-table :weakness :key) :reader method-combination-%generic-functions)))
 
 (defclass long-method-combination (standard-method-combination)
-  ((function
-    :initarg :function
-    :reader long-method-combination-function)
-   (args-lambda-list
-    :initarg :args-lambda-list
-    :reader long-method-combination-args-lambda-list)))
+  ((function :initarg :function :reader long-method-combination-function)
+   (args-lambda-list :initarg :args-lambda-list
+                     :reader long-method-combination-args-lambda-list)))
 
 (defclass short-method-combination (standard-method-combination)
-  ((operator
-    :reader short-combination-operator
-    :initarg :operator)
-   (identity-with-one-argument
-    :reader short-combination-identity-with-one-argument
+  ((operator :reader short-combination-operator :initarg :operator)
+   (identity-with-one-argument :reader short-combination-identity-with-one-argument
     :initarg :identity-with-one-argument)))
 
-(defclass slot-definition (metaobject)
+(defclass slot-definition (metaobject definition-source-mixin)
   ((name
     :initform nil
     :initarg :name
@@ -451,8 +436,7 @@
     ;; KLUDGE: we need a reader for bootstrapping purposes, in
     ;; COMPUTE-EFFECTIVE-SLOT-DEFINITION-INITARGS.
     :reader %slot-definition-documentation)
-   (%class :initform nil :initarg :class :accessor slot-definition-class)
-   (source :initform nil :initarg source :accessor definition-source)))
+   (%class :initform nil :initarg :class :accessor slot-definition-class)))
 
 (defclass standard-slot-definition (slot-definition)
   ((allocation
@@ -509,6 +493,7 @@
 ;;; these functions can access the SLOT-INFO directly, avoiding the overhead
 ;;; of accessing a standard-instance.
 (defstruct (slot-info
+            (:copier nil)
             (:constructor make-slot-info
                 (&key slotd typecheck
                  (reader (uninitialized-accessor-function :reader slotd))
@@ -561,6 +546,8 @@
 ;;; and vestiges of PROTOTYPE specializers
 (defclass standard-specializer (specializer) ())
 
+;;; Note that this class cannot define the OBJECT slot and
+;;; SPECIALIZER-OBJECT reader because of bootstrapping limitations.
 (defclass specializer-with-object (specializer) ())
 
 (defclass exact-class-specializer (specializer) ())
@@ -572,12 +559,15 @@
            :reader specializer-class
            :reader specializer-object)))
 
-(defclass class-prototype-specializer (standard-specializer specializer-with-object)
+(defclass class-prototype-specializer (standard-specializer
+                                       specializer-with-object)
   ((object :initarg :class
            :reader specializer-class
            :reader specializer-object)))
 
-(defclass eql-specializer (standard-specializer exact-class-specializer specializer-with-object)
+(defclass eql-specializer (standard-specializer
+                           exact-class-specializer
+                           specializer-with-object)
   ((object :initarg :object :reader specializer-object
            :reader eql-specializer-object)
    ;; Because EQL specializers are interned, any two putative instances
@@ -607,9 +597,8 @@
   ;; Need to lock, so that two threads don't get non-EQ specializers
   ;; for an EQL object.
   (with-locked-system-table (*eql-specializer-table*)
-    (or (gethash object *eql-specializer-table*)
-        (setf (gethash object *eql-specializer-table*)
-              (make-instance 'eql-specializer :object object)))))
+    (ensure-gethash object *eql-specializer-table*
+                    (make-instance 'eql-specializer :object object))))
 
 (defclass class (dependent-update-mixin
                  definition-source-mixin
@@ -708,7 +697,7 @@
   ((source
     :initform nil
     :reader definition-source
-    :initarg :definition-source)))
+    :initarg source)))
 
 (defclass plist-mixin (standard-object)
   ((plist :initform () :accessor object-plist :initarg plist)))

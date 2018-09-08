@@ -16,8 +16,9 @@
 ;;; The current level we are printing at, to be compared against
 ;;; *PRINT-LEVEL*. See the macro DESCEND-INTO for a handy interface to
 ;;; depth abbreviation.
-(declaim (index *current-level-in-print*))
 (!defvar *current-level-in-print* 0)
+(declaim (index *current-level-in-print*)
+         (always-bound *current-level-in-print*))
 
 ;;; Automatically handle *PRINT-LEVEL* abbreviation. If we are too
 ;;; deep, then a #\# is printed to STREAM and BODY is ignored.
@@ -181,15 +182,13 @@
      nil)
     (t
      (write-char #\# stream)
-     (let ((*print-base* 10) (*print-radix* nil))
-       (cond ((minusp marker)
-              (output-integer (- marker) stream)
-              (write-char #\# stream)
-              nil)
-             (t
-              (output-integer marker stream)
-              (write-char #\= stream)
-              t))))))
+     (output-integer (abs marker) stream 10 nil)
+     (cond ((minusp marker)
+            (write-char #\# stream)
+            nil)
+           (t
+            (write-char #\= stream)
+            t)))))
 
 (defmacro with-circularity-detection ((object stream) &body body)
   (with-unique-names (marker body-name)

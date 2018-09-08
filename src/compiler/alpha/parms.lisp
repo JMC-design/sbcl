@@ -9,6 +9,13 @@
 
 (in-package "SB!VM")
 
+(defconstant sb!assem:assem-scheduler-p nil)
+(defconstant sb!assem:+inst-alignment-bytes+ 4)
+
+(defconstant +backend-fasl-file-implementation+ :alpha)
+
+(defconstant +backend-page-bytes+ 8192)
+
 (eval-when  (:compile-toplevel :load-toplevel :execute)
 
 ;;; number of bits per word where a word holds one lisp descriptor
@@ -17,10 +24,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 64)
-
-;;; number of bits per byte where a byte is the smallest addressable
-;;; object
-(defconstant n-byte-bits 8)
 
 (defconstant float-sign-shift 31)
 
@@ -113,20 +116,11 @@
   (defconstant read-only-space-start #x20000000)
   (defconstant read-only-space-end   #x24000000))
 
-#!+osf1
-(progn
-  (defconstant read-only-space-start #x10000000)
-  (defconstant read-only-space-end   #x25000000))
-
-
 (defconstant static-space-start    #x28000000)
 (defconstant static-space-end      #x2c000000)
 
-(defconstant dynamic-0-space-start   #x30000000)
-(defconstant dynamic-0-space-end     #x3fff0000)
-
-(defconstant dynamic-1-space-start   #x40000000)
-(defconstant dynamic-1-space-end     #x4fff0000)
+(defparameter dynamic-0-space-start  #x30000000)
+(defparameter dynamic-0-space-end    #x3fff0000)
 
 ;;; FIXME nothing refers to either of these in alpha or x86 cmucl
 ;;; backend, so they could probably be removed.
@@ -146,7 +140,6 @@
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
@@ -155,7 +148,8 @@
   ;; are still needed to avoid undefined variable warnings during sbcl
   ;; build.
   single-step-around-trap
-  single-step-before-trap)
+  single-step-before-trap
+  error-trap)
 
 ;;;; static symbols
 
@@ -167,14 +161,12 @@
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '()))
+(defconstant-eqx +static-symbols+
+  `#(,@+common-static-symbols+)
+  #'equalp)
 
-(defparameter *static-funs*
-  '(length
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -196,4 +188,5 @@
     two-arg-xor
     two-arg-eqv
     two-arg-gcd
-    two-arg-lcm))
+    two-arg-lcm)
+  #'equalp)

@@ -37,14 +37,17 @@ os_vm_address_t arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *contex
 
 void arch_skip_instruction(os_context_t *context)
 {
-    /* KLUDGE: Other platforms check for trap codes and skip inlined
-     * trap/error parameters.  We should too. */
-
-    /* Note that we're doing integer arithmetic here, not pointer. So
-     * the value that the return value of os_context_pc_addr() points
-     * to will be incremented by 4, not 32.
-     */
+    u32 trap_instruction = *((u32 *)*os_context_pc_addr(context));
+    unsigned code = trap_instruction >> 5 & 0xFF;
     *os_context_pc_addr(context) += 4;
+    switch (code)
+    {
+    case trap_Error:
+    case trap_Cerror:
+        skip_internal_error(context);
+    default:
+        break;
+    }
 }
 
 unsigned char *arch_internal_error_arguments(os_context_t *context)
@@ -114,13 +117,7 @@ arch_handle_fun_end_breakpoint(os_context_t *context)
 void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
-    unsigned char register_offset =
-        *((unsigned char *)(*os_context_pc_addr(context))+5);
-    handle_single_step_trap(context, trap, register_offset);
-    /* KLUDGE: arch_skip_instruction() only skips one instruction, and
-     * there is a following word to deal with as well, so skip
-     * twice. */
-    arch_skip_instruction(context);
+    handle_single_step_trap(context, trap, reg_LEXENV);
     arch_skip_instruction(context);
 }
 
@@ -136,10 +133,16 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
 
     handle_trap(context, code);
 }
+void
+sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
+    fake_foreign_function_call(context);
+    lose("Unhandled SIGILL at %p.", *os_context_pc_addr(context));
+}
 
 void arch_install_interrupt_handlers()
 {
     undoably_install_low_level_interrupt_handler(SIGTRAP, sigtrap_handler);
+    undoably_install_low_level_interrupt_handler(SIGILL, sigill_handler);
 }
 
 
@@ -150,10 +153,14 @@ void arch_install_interrupt_handlers()
  * Linkage entry size is 16, because we need 2 instructions and an 8 byte address.
  */
 
-#define LINKAGE_TEMP_REG        reg_NFP
+#define LINKAGE_TEMP_REG reg_NL9
 
-void arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+void arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+  if (datap) {
+    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
+    return;
+  }
   /*
     ldr reg,=address
     br  reg
@@ -173,15 +180,8 @@ void arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
   *inst_ptr++ = inst;
 
   // address
-  *(unsigned long *)inst_ptr++ = target_addr;
+  *(unsigned long *)inst_ptr++ = (unsigned long)target_addr;
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
-
-void
-arch_write_linkage_table_ref(void * reloc_addr, void *target_addr)
-{
-    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-}
-
 #endif

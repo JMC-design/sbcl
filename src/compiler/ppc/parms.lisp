@@ -13,16 +13,38 @@
 
 (in-package "SB!VM")
 
+; ok, so we're supposed to use our instruction scheduler, but we don't,
+; because of "needs a little more work in the assembler"
+(defconstant sb!assem:assem-scheduler-p nil)
+(defconstant sb!assem:+inst-alignment-bytes+ 4)
+
+(defconstant +backend-fasl-file-implementation+ :ppc)
+  ;; On Linux, the ABI specifies the page size to be 4k-64k, use the
+  ;; maximum of that range. FIXME: it'd be great if somebody would
+  ;; find out whether using exact multiples of the page size actually
+  ;; matters in the few places where that's done, or whether we could
+  ;; just use 4k everywhere.
+(defconstant +backend-page-bytes+ #!+linux 65536 #!-linux 4096)
+
+;;; The size in bytes of GENCGC cards, i.e. the granularity at which
+;;; writes to old generations are logged.  With mprotect-based write
+;;; barriers, this must be a multiple of the OS page size.
+(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The minimum size of new allocation regions.  While it doesn't
+;;; currently make a lot of sense to have a card size lower than
+;;; the alloc granularity, it will, once we are smarter about finding
+;;; the start of objects.
+(defconstant gencgc-alloc-granularity 0)
+;;; The minimum size at which we release address ranges to the OS.
+;;; This must be a multiple of the OS page size.
+(defconstant gencgc-release-granularity +backend-page-bytes+)
+
 ;;; number of bits per word where a word holds one lisp descriptor
 (defconstant n-word-bits 32)
 
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 32)
-
-;;; number of bits per byte where a byte is the smallest addressable
-;;; object
-(defconstant n-byte-bits 8)
 
 ;;; flags for the generational garbage collector
 (defconstant pseudo-atomic-interrupted-flag 1)
@@ -113,19 +135,15 @@
 (progn
   #!-gencgc
   (progn
-    (defconstant dynamic-0-space-start #x4f000000)
-    (defconstant dynamic-0-space-end   #x66fff000)
-    (defconstant dynamic-1-space-start #x67000000)
-    (defconstant dynamic-1-space-end   #x7efff000)))
+    (defparameter dynamic-0-space-start #x4f000000)
+    (defparameter dynamic-0-space-end   #x66fff000)))
 
 #!+netbsd
 (progn
   #!-gencgc
   (progn
-    (defconstant dynamic-0-space-start #x4f000000)
-    (defconstant dynamic-0-space-end   #x66fff000)
-    (defconstant dynamic-1-space-start #x67000000)
-    (defconstant dynamic-1-space-end   #x7efff000)))
+    (defparameter dynamic-0-space-start #x4f000000)
+    (defparameter dynamic-0-space-end   #x66fff000)))
 
 ;;; Text and data segments start at #x01800000.  Range for randomized
 ;;; malloc() starts #x20000000 (MAXDSIZ) after end of data seg and
@@ -138,33 +156,26 @@
 (progn
   #!-gencgc
   (progn
-    (defconstant dynamic-0-space-start #x4f000000)
-    (defconstant dynamic-0-space-end   #x5cfff000)
-    (defconstant dynamic-1-space-start #x5f000000)
-    (defconstant dynamic-1-space-end   #x6cfff000)))
+    (defparameter dynamic-0-space-start #x4f000000)
+    (defparameter dynamic-0-space-end   #x5cfff000)))
 
 #!+darwin
 (progn
   #!-gencgc
   (progn
-    (defconstant dynamic-0-space-start #x10000000)
-    (defconstant dynamic-0-space-end   #x3ffff000)
-
-    (defconstant dynamic-1-space-start #x40000000)
-    (defconstant dynamic-1-space-end   #x6ffff000)))
+    (defparameter dynamic-0-space-start #x10000000)
+    (defparameter dynamic-0-space-end   #x3ffff000)))
 
-;;;; Other miscellaneous constants.
-
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   after-breakpoint-trap
   single-step-around-trap
-  single-step-before-trap)
+  single-step-before-trap
+  error-trap)
 
 ;;;; Static symbols.
 
@@ -177,21 +188,12 @@
 ;;; space directly after the static symbols.  That way, the raw-addr
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
-(defparameter *static-symbols*
-  (append
-   *common-static-symbols*
-   *c-callable-static-symbols*
-   '(
-     #!+gencgc *restart-lisp-function*
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+)
+  #'equalp)
 
-     ;; CLH: 20060210 Taken from x86-64/parms.lisp per JES' suggestion
-     ;; Needed for callbacks to work across saving cores. see
-     ;; ALIEN-CALLBACK-ASSEMBLER-WRAPPER in c-call.lisp for gory
-     ;; details.
-     sb!alien::*enter-alien-callback*)))
-
-(defparameter *static-funs*
-  '(length
+(defconstant-eqx +static-fdefns+
+  #(length
     two-arg-+
     two-arg--
     two-arg-*
@@ -209,4 +211,5 @@
     two-arg-xor
     two-arg-eqv
     two-arg-gcd
-    two-arg-lcm))
+    two-arg-lcm)
+  #'equalp)

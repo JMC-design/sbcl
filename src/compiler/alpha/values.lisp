@@ -95,7 +95,7 @@
   (:policy :fast-safe)
   (:results (start :scs (any-reg))
             (count :scs (any-reg)))
-  (:temporary (:scs (descriptor-reg) :type list :from (:argument 0)) list)
+  (:temporary (:scs (descriptor-reg) :from (:argument 0)) list)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:vop-var vop)
@@ -114,7 +114,7 @@
     (inst and list lowtag-mask ndescr)
     (inst xor ndescr list-pointer-lowtag ndescr)
     (inst beq ndescr loop)
-    (error-call vop 'bogus-arg-to-values-list-error list)
+    (cerror-call vop 'bogus-arg-to-values-list-error list)
 
     DONE
     (inst subq csp-tn start count)))

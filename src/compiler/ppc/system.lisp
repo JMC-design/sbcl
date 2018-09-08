@@ -13,15 +13,6 @@
 
 ;;;; Type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst andi. result object lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -93,7 +84,9 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst srwi res res n-widetag-bits)))
+    ;; Shift right by 8 bits (i.e. rotate left 24)
+    ;; and take the 15 rightmost bits.
+    (inst rlwinm res res 24 17 31)))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -111,7 +104,12 @@
        (inst slwi t2 data (- n-widetag-bits n-fixnum-tag-bits))
        (inst or t1 t1 t2))
       (immediate
-       (inst ori t1 t1 (ash (tn-value data) n-widetag-bits)))
+       (let ((val (ash (tn-value data) n-widetag-bits)))
+         (cond ((typep val '(unsigned-byte 16))
+                (inst ori t1 t1 val))
+               (t
+                (inst lr t2 val)
+                (inst or t1 t1 t2)))))
       (zero))
     (storew t1 x 0 other-pointer-lowtag)
     (move res x)))
@@ -197,24 +195,13 @@
   (:generator 1
     (inst unimp pending-interrupt-trap)))
 
-#!+sb-safepoint
-(define-vop (insert-safepoint)
-  (:policy :fast-safe)
-  (:translate sb!kernel::gc-safepoint)
-  (:generator 0
-    (emit-safepoint)))
-
-#!+sb-thread
-(defknown current-thread-offset-sap ((unsigned-byte 64))
-  system-area-pointer (flushable))
-
 #!+sb-thread
 (define-vop (current-thread-offset-sap)
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:translate current-thread-offset-sap)
-  (:args (n :scs (unsigned-reg) :target sap))
-  (:arg-types unsigned-num)
+  (:args (n :scs (signed-reg) :target sap))
+  (:arg-types signed-num)
   (:policy :fast-safe)
   (:generator 2
     (inst slwi n n word-shift)
@@ -240,34 +227,29 @@
 
 ;;;; Memory barrier support
 
-#!+memory-barrier-vops
 (define-vop (%compiler-barrier)
   (:policy :fast-safe)
   (:translate %compiler-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%memory-barrier)
   (:policy :fast-safe)
   (:translate %memory-barrier)
   (:generator 3
      (inst sync)))
 
-#!+memory-barrier-vops
 (define-vop (%read-barrier)
   (:policy :fast-safe)
   (:translate %read-barrier)
   (:generator 3
      (inst sync)))
 
-#!+memory-barrier-vops
 (define-vop (%write-barrier)
   (:policy :fast-safe)
   (:translate %write-barrier)
   (:generator 3
     (inst sync)))
 
-#!+memory-barrier-vops
 (define-vop (%data-dependency-barrier)
   (:policy :fast-safe)
   (:translate %data-dependency-barrier)

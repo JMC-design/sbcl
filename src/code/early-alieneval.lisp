@@ -9,7 +9,9 @@
 
 (in-package "SB!ALIEN")
 
-(defvar *alien-type-classes* (make-hash-table :test 'eq))
+(defglobal *alien-type-classes* (make-hash-table :test 'eq))
+
+(!define-thread-local *saved-fp* nil)
 
 (defvar *new-auxiliary-types* nil)
 
@@ -30,12 +32,15 @@
 (defvar *default-c-string-external-format* nil)
 
 (defmacro define-alien-type-translator (name lambda-list &body body)
-  (let ((defun-name (symbolicate "ALIEN-" name "-TYPE-TRANSLATOR")))
-    `(eval-when (:compile-toplevel :load-toplevel :execute)
-       (setf (symbol-function ',defun-name)
-             ,(make-macro-lambda defun-name lambda-list body
-                                 'define-alien-type-translator name))
-       (%define-alien-type-translator ',name #',defun-name))))
+  (let ((defun-name (symbolicate "ALIEN-" name "-TYPE-TRANSLATOR"))
+        (macro-lambda
+         (make-macro-lambda nil lambda-list body
+                            'define-alien-type-translator name)))
+    `(progn
+       (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+         (defun ,defun-name ,(second macro-lambda) ,@(cddr macro-lambda)))
+       (eval-when (:compile-toplevel :load-toplevel :execute)
+         (%define-alien-type-translator ',name #',defun-name)))))
 
 ;;; Process stuff in a new scope.
 (defmacro with-auxiliary-alien-types (env &body body)
@@ -46,7 +51,6 @@
          ,@body)))
 
 (defmacro define-alien-type (name type &environment env)
-  #!+sb-doc
   "Define the alien type NAME to be equivalent to TYPE. Name may be NIL for
    STRUCT and UNION types, in which case the name is taken from the type
    specifier."
@@ -57,9 +61,7 @@
              `((%def-auxiliary-alien-types ',*new-auxiliary-types*
                                            (sb!c:source-location))))
          ,@(when name
-             `((%define-alien-type ',name ',alien-type)
-               (setf (info :source-location :alien-type ',name)
-                     (sb!c:source-location))))))))
+             `((%define-alien-type ',name ',alien-type (sb!c:source-location))))))))
 
 (defstruct (alien-type-class (:copier nil))
   (name nil :type symbol)
